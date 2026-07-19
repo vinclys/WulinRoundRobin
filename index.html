@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0d0807">
+  <meta name="description" content="武林年度赛实时赛程、场地、计分、排名与 Playoff 大屏">
+  <title>武林年度赛 · Live Tournament Control</title>
+  <link rel="icon" href="/assets/Logo_New.jpg">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <img src="/assets/Logo_New.jpg" class="logo" alt="Wulin logo">
+        <div class="brand-title">
+          <h1 id="eventTitle">武林年度赛 Tournament Control</h1>
+          <p>赛程 · 叫号 · 场地 · 计分 · Playoff</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <img src="/assets/GoldCoast.png" class="partner" alt="Gold Coast">
+        <div class="cloud-status loading" id="cloudStatus" role="status" aria-live="polite">
+          <span class="cloud-dot"></span><span id="cloudStatusText">连接云端</span>
+        </div>
+        <div class="clock" id="clock">--:--<small>--</small></div>
+        <button class="ghost small" data-action="fullscreen">大屏全屏</button>
+      </div>
+    </header>
+
+    <nav class="tabs no-print" id="tabs">
+      <button class="tab active" data-action="show-view" data-view="dashboard">大屏 Dashboard</button>
+      <button class="tab" data-action="show-view" data-view="schedule">完整赛程</button>
+      <button class="tab" data-action="show-view" data-view="admin">后台管理</button>
+    </nav>
+
+    <main>
+      <section class="view active" id="view-dashboard"></section>
+      <section class="view" id="view-schedule"></section>
+      <section class="view" id="view-admin"></section>
+    </main>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script type="module" src="/src/app.js"></script>
+</body>
+</html>
