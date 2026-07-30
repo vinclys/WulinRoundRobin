@@ -59,3 +59,8 @@ This favors data safety over last-write-wins.
 - Pending state and its expected cloud version are persisted locally.
 - On reconnection, the app saves only if the cloud version is unchanged.
 - If another device changed the event while offline, the app stops and reports a conflict.
+
+
+## v6 state additions
+
+The existing JSONB state now also carries `settings.prepareLimit`, `settings.courts[].allowAllActive`, and `categories[].active`. No relational schema migration is required.

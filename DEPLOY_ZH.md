@@ -1,3 +1,7 @@
+# 注意：已有旧云端部署请使用 UPDATE_EXISTING_DEPLOYMENT_ZH.md
+
+本文件主要用于全新 Supabase + Vercel 项目。
+
 # 武林年度赛实时版：Supabase + Vercel 部署手册
 
 ## 1. 部署后的结构
@@ -349,7 +353,8 @@ score.wulin.example
 
 建议使用：
 
-- 大屏：`https://your-domain/?view=dashboard`
+- TV 1 场地候场：`https://your-domain/?view=operations`
+- TV 2 排名与 Playoff：`https://your-domain/?view=results`
 - 完整赛程：`https://your-domain/?view=schedule`
 - 工作人员：`https://your-domain/?view=admin`
 
