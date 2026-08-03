@@ -1,66 +1,113 @@
-# Architecture notes
+# Architecture notes · v7
 
-## Why the live state is one JSONB row
+## Shared-state model
 
-The existing tournament engine already represents all categories, pools, teams, courts, queue priority, matches, scores and playoff links as one deterministic state object. The cloud version keeps that model in `tournaments.state` and adds a database `version`.
+The application stores one deterministic tournament state object in `public.tournaments.state` and keeps a separate numeric database row `version` for optimistic locking.
 
-Advantages for this event:
+The state includes Categories, Pools, teams, Courts, Court routes, On Deck priority, preferred Courts, Round Robin matches, scores, standings inputs and the complete Playoff graph.
 
-- One score/queue operation is saved atomically.
-- A Dashboard never receives a partially updated playoff bracket.
-- Existing RR, playoff, third-place and score-correction logic remains unchanged.
-- JSON export/import is a direct snapshot of the cloud state.
-- Optimistic locking is simple: update only when `version = expectedVersion`.
-- Historical rollback stores exact complete snapshots.
+This model gives the event:
 
-Trade-off:
+- atomic score and queue updates;
+- no partially updated bracket on public screens;
+- direct JSON export/import backup;
+- simple multi-device conflict detection;
+- exact history snapshots for recovery.
 
-- Every Realtime update sends the current state row rather than a small match delta.
-- This is appropriate for a six-court annual event with a moderate audience.
-- For a much larger public audience or multiple simultaneous tournaments, split matches into normalized tables and use Supabase Broadcast/delta events.
+For this six-Court annual event, sending one moderate JSON row on each Realtime update is practical. A much larger multi-event platform should normalize matches and use smaller delta messages.
+
+## v7 competition rules
+
+### Standings
+
+`calculateStandings()` uses:
+
+1. win points;
+2. direct head-to-head when exactly two teams are tied;
+3. head-to-head mini-table when three or more teams are tied;
+4. overall point differential;
+5. overall points for;
+6. team name only as a deterministic final fallback.
+
+### Playoff seeding
+
+`buildFirstRoundPairs()` explicitly handles the common two-Pool/top-two format:
+
+```text
+Pool A #1 vs Pool B #2
+Pool A #2 vs Pool B #1
+```
+
+Larger brackets use seed ordering and opponent swaps to avoid same-Pool opening matches whenever a cross-Pool arrangement exists.
+
+### Court routes
+
+Each Court has:
+
+```json
+{
+  "allowAllActive": false,
+  "poolAccess": {
+    "category-id": ["pool-a-id"]
+  }
+}
+```
+
+- Category access still uses `category.courtIds` for compatibility with v6.
+- `poolAccess[categoryId] = ["*"]` means all Pools in that Category.
+- Round Robin scheduling respects both Category and Pool.
+- A cross-Pool Playoff match can use any Court opened to that Category.
+
+### On Deck
+
+`settings.prepareMatchIds` stores staff-priority matches. A queued match can also carry:
+
+```json
+{"preferredCourtId":"court4"}
+```
+
+Manual entries are displayed first and remain visible even when one team is currently playing. Automatic entries are then selected by Court route, avoiding duplicate teams and covering different configured Courts before adding a second entry for the same Court.
 
 ## Security boundaries
 
 ### Browser
 
 - Contains only Supabase URL and publishable key.
-- RLS permits SELECT of public tournaments only.
-- Does not contain the staff PIN, Session secret or Supabase secret key.
+- RLS permits SELECT of public events only.
+- Never receives staff PIN, Session secret or Supabase secret key.
 
 ### Vercel Functions
 
-- `/api/login` validates the staff PIN stored in `ADMIN_PIN`.
+- `/api/login` validates `ADMIN_PIN`.
 - A signed 12-hour HttpOnly, SameSite cookie represents the staff session.
-- `/api/state` verifies the cookie and event slug before any write.
-- The Supabase secret key is used only here.
+- `/api/state` verifies the cookie, same-origin request and event slug.
+- Server-side Supabase secret key performs the write.
 
 ### Supabase
 
 - `tournaments` has RLS enabled.
 - Public roles receive SELECT only.
-- `save_tournament_state` is executable by `service_role` only.
-- The RPC performs an atomic version check, saves the new snapshot and records history.
+- `save_tournament_state` is executable only by the service role.
+- The RPC checks the expected row version, saves atomically and writes history.
 
 ## Conflict behavior
 
-1. Staff device A and B both load version 10.
-2. A saves and creates version 11.
-3. B attempts to save with expected version 10.
-4. PostgreSQL updates zero rows and raises `VERSION_CONFLICT`.
+1. Staff A and B both load row version 20.
+2. A saves and creates version 21.
+3. B attempts a save with expected version 20.
+4. PostgreSQL raises `VERSION_CONFLICT`.
 5. Vercel returns HTTP 409 with the latest cloud state.
-6. B keeps its attempted state in a local conflict backup, loads version 11, and asks the operator to repeat the intended action.
+6. B stores the attempted state as a local conflict backup and loads version 21.
 
-This favors data safety over last-write-wins.
+This intentionally favors data safety over last-write-wins.
 
-## Offline behavior
+## Upgrade behavior
 
-- Public screens continue showing the most recent local cache.
-- A previously authenticated staff screen can continue making local edits while offline.
-- Pending state and its expected cloud version are persisted locally.
-- On reconnection, the app saves only if the cloud version is unchanged.
-- If another device changed the event while offline, the app stops and reports a conflict.
+Existing v6 data is normalized in the browser:
 
+- state format becomes version 7;
+- missing `court.poolAccess` becomes `{}`;
+- a Category already assigned to a Court defaults to all Pools until staff narrows it;
+- missing `match.preferredCourtId` becomes an empty string.
 
-## v6 state additions
-
-The existing JSONB state now also carries `settings.prepareLimit`, `settings.courts[].allowAllActive`, and `categories[].active`. No relational schema migration is required.
+The first successful v7 admin save writes the normalized state back to the same Supabase row. No destructive SQL migration is required.

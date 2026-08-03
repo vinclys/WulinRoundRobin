@@ -13,5 +13,30 @@ export function validateTournamentState(state) {
   }
   if (state.categories.length > 100) return "too many categories";
   if (state.matches.length > 20_000) return "too many matches";
+
+  for (const court of state.settings.courts) {
+    if (!court || typeof court !== "object" || Array.isArray(court)) {
+      return "every court must be an object";
+    }
+    if (typeof court.id !== "string" || !court.id.trim()) return "every court must have an id";
+    if (court.poolAccess !== undefined) {
+      if (!court.poolAccess || typeof court.poolAccess !== "object" || Array.isArray(court.poolAccess)) {
+        return "court.poolAccess must be an object";
+      }
+      for (const poolIds of Object.values(court.poolAccess)) {
+        if (!Array.isArray(poolIds) || poolIds.length > 100 || poolIds.some((value) => typeof value !== "string")) {
+          return "court.poolAccess entries must be arrays of pool ids";
+        }
+      }
+    }
+  }
+
+  for (const match of state.matches) {
+    if (!match || typeof match !== "object" || Array.isArray(match)) return "every match must be an object";
+    if (match.preferredCourtId !== undefined && typeof match.preferredCourtId !== "string") {
+      return "match.preferredCourtId must be a string";
+    }
+  }
+
   return null;
 }

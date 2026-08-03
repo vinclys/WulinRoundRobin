@@ -1,0 +1,25 @@
+For an existing v6 repository, copy/replace these paths from the v7 package:
+
+api/
+public/
+server/
+src/
+supabase/
+tests/
+.env.example
+.gitignore
+ARCHITECTURE.md
+CHANGELOG_V7.md
+docs/
+DEPLOY_ZH.md
+README.md
+RELEASE_CHECKLIST_V7_ZH.md
+UPDATE_EXISTING_DEPLOYMENT_ZH.md
+FILES_TO_REPLACE.txt
+index.html
+package.json
+vercel.json
+
+Preserve the existing repository's hidden .git folder.
+Do not copy or commit .env or .env.local.
+Do not re-run supabase/schema.sql against the existing production Supabase project.

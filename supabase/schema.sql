@@ -1,4 +1,4 @@
--- Wulin Tournament Control Cloud schema
+-- Wulin Tournament Control Cloud v7 schema
 -- Run this entire file once in Supabase Dashboard > SQL Editor.
 
 begin;
@@ -127,7 +127,7 @@ values (
   '武林年度赛 Tournament Control',
   $state$
   {
-    "version": 6,
+    "version": 7,
     "settings": {
       "eventName": "武林年度赛 Tournament Control",
       "autoNext": true,
@@ -135,12 +135,12 @@ values (
       "prepareLimit": 6,
       "prepareMatchIds": [],
       "courts": [
-        {"id":"court1","name":"Court 1","allowAllActive":false},
-        {"id":"court2","name":"Court 2","allowAllActive":false},
-        {"id":"court3","name":"Court 3","allowAllActive":false},
-        {"id":"court4","name":"Court 4","allowAllActive":false},
-        {"id":"court5","name":"Court 5","allowAllActive":false},
-        {"id":"court6","name":"Court 6","allowAllActive":false}
+        {"id":"court1","name":"Court 1","allowAllActive":false,"poolAccess":{}},
+        {"id":"court2","name":"Court 2","allowAllActive":false,"poolAccess":{}},
+        {"id":"court3","name":"Court 3","allowAllActive":false,"poolAccess":{}},
+        {"id":"court4","name":"Court 4","allowAllActive":false,"poolAccess":{}},
+        {"id":"court5","name":"Court 5","allowAllActive":false,"poolAccess":{}},
+        {"id":"court6","name":"Court 6","allowAllActive":false,"poolAccess":{}}
       ]
     },
     "categories": [],
