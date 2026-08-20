@@ -1,57 +1,222 @@
-# 武林年度赛 v6：更新现有 Vercel + Supabase 部署
+# 武林年度赛 Cloud v8：更新现有 Vercel + Supabase 部署
 
-本版本把已经确认的 v6 本地预览功能合并到正式云端版：
+适用情况：
 
-- TV 1：6 个当前场地 + Next 3–6 Games；
-- TV 2：可选择公开 Cat 的 Round Robin leaderboard、Playoff 和奖牌排名；
-- Current Session Active Cats；
-- 每个 Court 在场地卡片内直接设置 `ALL ACTIVE` 或可运行 Cat；
-- Court 和 Queue 显示准确的 `RR ROUND x/y`；
-- 后台 3 列 × 2 行六场地中控；
-- Cat / Pool 双层 Tabs；
-- Supabase Realtime、多设备版本锁、Vercel 安全 PIN Session 保持不变。
+- 网站已经部署在 Vercel；
+- GitHub repository 已连接 Vercel；
+- 正式比赛数据已经存入 Supabase；
+- 需要保留现有 Categories、Pools、Teams、RR 分数、Courts、Queue 和历史版本。
 
-## 最重要的结论
-
-**升级已经部署的项目不需要重新建立 Supabase，也不需要删除或重建数据库。**
-
-`tournaments.state` 是 JSONB；v6 前端会兼容并自动补齐旧状态缺少的字段。现有 Cat、Pool、队伍、赛程、比分和 Playoff 数据会保留。第一次用 v6 后台保存时，补齐后的 v6 状态会写回同一条云端记录。
+v8 是前端、规则引擎与 JSONB state 格式升级。现有 Supabase 表结构、RLS、Realtime publication、RPC、API keys 与 Vercel Project 均可继续使用。
 
 ---
 
-## A. 升级前备份
+## 一、v8 新功能与规则
 
-### 1. 从旧线上 App 导出
+### 三 Pool、每 Pool 前两名
 
-1. 打开旧线上网址的后台。
-2. 登录工作人员 PIN。
-3. 点击「导出备份 JSON」。
-4. 把文件保存为类似：
+六支出线队伍先产生跨 Pool Seeds 1–6：
 
 ```text
-wulin_before_v6_2026-08-xx.json
+1. Win Points
+2. Head-to-Head（仅适用于确实在同一 Pool 交手的同分队伍）
+3. Point Difference
+4. Points For
 ```
 
-### 2. 可选：Supabase SQL 备份
+不同 Pool 的队伍没有直接交手，因此没有 H2H 时直接比较 DIFF / PF。后台允许工作人员手动 Move Up / Move Down，手动结果优先。
 
-在 Supabase Dashboard → SQL Editor 运行：
+Playoff 路径：
 
 ```text
-supabase/backup_before_v6.sql
+Seed 1  ───────────────┐
+                       ├─ SF1 ─┐
+Seed 4 ─┐              │       │
+        ├─ QF2 Winner ─┘       │
+Seed 5 ─┘                      ├─ Final
+                               │
+Seed 2  ───────────────┐       │
+                       ├─ SF2 ─┘
+Seed 3 ─┐              │
+        ├─ QF1 Winner ─┘
+Seed 6 ─┘
 ```
 
-保存查询结果。不要清空 `tournaments` 或 `tournament_state_history`。
+官方比赛编号顺序：
+
+```text
+QF1 = Seed 3 vs Seed 6
+QF2 = Seed 4 vs Seed 5
+SF1 = Seed 1 vs Winner QF2
+SF2 = Seed 2 vs Winner QF1
+Final = Winner SF1 vs Winner SF2
+```
+
+### TV 1
+
+- 每个 Active Category 独立显示 Done / Total、Queue、Live；
+- 不再只显示一个全赛事 Completed / In Queue 数字；
+- Expected Court 字样加大；
+- iPad landscape 保持 On Deck 与 6 Live Courts 横向同屏。
+
+### Admin
+
+- Score Corrections 移到页面最后；
+- 按 Category 折叠；
+- 打开某个 Category 后才查看该项目比分细节；
+- 修改 RR 分数后立即重算排名；
+- 修改 Playoff 胜者后清理并重建受影响的下游分支。
 
 ---
 
-## B. 用 v6 文件覆盖现有 GitHub Repository
+## 二、升级前备份
 
-### 方法 1：使用 Windows 文件夹和 GitHub Desktop
+### 1. 从正式 Admin 导出 JSON
 
-1. 解压本 ZIP。
-2. 打开你原本连接 Vercel 的 GitHub repository 本地文件夹。
-3. 保留原 repository 的 `.git` 隐藏文件夹。
-4. 把 v6 项目的下列内容复制进原 repository，选择覆盖：
+打开：
+
+```text
+https://你的正式域名/?view=admin
+```
+
+登录后点击：
+
+```text
+EXPORT BACKUP JSON
+```
+
+建议命名：
+
+```text
+wulin_before_v8_YYYY-MM-DD.json
+```
+
+这份 JSON 是最快的完整恢复文件。
+
+### 2. 从 Supabase 保存数据库快照
+
+打开：
+
+```text
+Supabase Dashboard
+→ SQL Editor
+→ New query
+```
+
+运行：
+
+```text
+supabase/backup_before_v8.sql
+```
+
+下载或复制 Result。
+
+### 3. 不要做这些操作
+
+```text
+不要删除 public.tournaments
+不要删除 public.tournament_state_history
+不要重新运行完整 schema.sql
+不要建立新的正式 event slug
+不要更换现有 Supabase keys
+```
+
+---
+
+## 三、确认 Vercel 当前 Production Source
+
+不要凭记忆假设正式版本一定来自 `main`。
+
+打开：
+
+```text
+Vercel Dashboard
+→ 当前 Wulin Project
+→ Deployments
+→ 当前 Production Deployment
+→ Source
+```
+
+记录：
+
+```text
+Git repository
+Git branch
+Commit SHA
+Production Branch
+```
+
+最安全的方法是直接从当前 Production commit 建立 v8 branch。
+
+---
+
+## 四、建立 v8 Git Branch
+
+进入原 Git repository：
+
+```bash
+cd YOUR_EXISTING_WULIN_REPOSITORY
+```
+
+更新远端资料：
+
+```bash
+git fetch origin
+```
+
+从刚才记录的 Production Commit SHA 建立 branch：
+
+```bash
+git switch -c upgrade/cloud-v8 PRODUCTION_COMMIT_SHA
+```
+
+确认：
+
+```bash
+git branch --show-current
+git log -1 --oneline
+```
+
+应看到：
+
+```text
+upgrade/cloud-v8
+```
+
+并且最新 commit 与当前线上 Production Source 相同。
+
+### GitHub Desktop 做法
+
+1. 打开原 repository；
+2. Fetch origin；
+3. 找到当前 Production 对应 branch / commit；
+4. `Current Branch → New Branch`；
+5. 名称填：
+
+```text
+upgrade/cloud-v8
+```
+
+---
+
+## 五、覆盖项目文件
+
+1. 解压：
+
+```text
+wulin-supabase-vercel-v8.zip
+```
+
+2. 打开解压目录；
+3. 把里面全部文件复制到原 Git repository 根目录；
+4. 选择覆盖同名文件；
+5. 必须保留原 repository 的隐藏文件夹：
+
+```text
+.git
+```
+
+主要文件包括：
 
 ```text
 api/
@@ -60,52 +225,164 @@ server/
 src/
 supabase/
 tests/
-.env.example
-.gitignore
-ARCHITECTURE.md
-DEPLOY_ZH.md
-README.md
-UPDATE_EXISTING_DEPLOYMENT_ZH.md
 index.html
 package.json
 vercel.json
+README.md
+UPDATE_EXISTING_DEPLOYMENT_ZH.md
 ```
 
-5. 不要把真实 `.env` 或 `.env.local` 上传到 GitHub。
-6. 在 GitHub Desktop 查看 Changes，确认没有 Secret Key。
-7. Commit message：
+不要复制或提交：
 
 ```text
-Upgrade Wulin tournament control to cloud v6
+.env
+.env.local
+真实 SUPABASE_SECRET_KEY
+真实 SESSION_SECRET
+真实 ADMIN_PIN
 ```
-
-8. Push origin。
-
-### 方法 2：命令行
-
-在原 repository 根目录执行：
-
-```bash
-git status
-git checkout -b upgrade/cloud-v6
-```
-
-把解压后的 v6 文件覆盖到这个目录，然后执行：
-
-```bash
-git status
-git add .
-git commit -m "Upgrade Wulin tournament control to cloud v6"
-git push -u origin upgrade/cloud-v6
-```
-
-建议先让 Vercel 为这个 branch 生成 Preview；确认无误后再 merge 到原本的 Production branch（通常是 `main`）。
 
 ---
 
-## C. Vercel 环境变量
+## 六、本地测试
 
-如果前一个云端版已经正常运行，以下变量继续沿用，通常不需要修改：
+项目需要 Node.js 20.19 或更新版本。
+
+运行：
+
+```bash
+npm install
+npm test
+npm run build
+```
+
+`npm test` 应通过 20 项测试，包括：
+
+```text
+Pool Head-to-Head
+Two-Pool crossover
+Three-Pool six-seed ranking
+Manual seed override
+Seed 3 vs 6 / Seed 4 vs 5
+Court Category + Pool routes
+Automatic On Deck
+Busy-team manual On Deck
+Session / Cookie / API security
+State validation
+```
+
+`npm run build` 成功后应产生：
+
+```text
+dist/
+```
+
+不要把 `node_modules` 提交到 GitHub。
+
+---
+
+## 七、Commit 与 Push
+
+检查变化：
+
+```bash
+git status
+```
+
+提交：
+
+```bash
+git add -A
+git commit -m "Upgrade Wulin tournament control to cloud v8"
+git push -u origin upgrade/cloud-v8
+```
+
+在 GitHub 建立 Pull Request：
+
+```text
+Compare: upgrade/cloud-v8
+Base: Vercel 设置中的 Production Branch
+```
+
+先不要 Merge。
+
+---
+
+## 八、Vercel Preview 安全设置
+
+GitHub branch push 后，连接的 Vercel Project 会建立 Preview Deployment。
+
+打开：
+
+```text
+Vercel Dashboard
+→ Project
+→ Deployments
+→ upgrade/cloud-v8 Preview
+```
+
+等待状态：
+
+```text
+Ready
+```
+
+### 为什么建议建立独立 Preview event
+
+如果 Preview Environment 与 Production 使用相同：
+
+```text
+SUPABASE_URL
+EVENT_SLUG
+SUPABASE_SECRET_KEY
+```
+
+那么 Preview Admin 的写入会修改正式比赛数据。
+
+### 建立 Preview event
+
+在 Supabase SQL Editor 运行：
+
+```text
+supabase/create_v8_preview_event.sql
+```
+
+它会复制正式 event 到：
+
+```text
+wulin-annual-2026-v8-preview
+```
+
+然后进入：
+
+```text
+Vercel
+→ Project Settings
+→ Environment Variables
+```
+
+只给 **Preview** Environment 设置：
+
+```text
+VITE_EVENT_SLUG=wulin-annual-2026-v8-preview
+EVENT_SLUG=wulin-annual-2026-v8-preview
+```
+
+其他 URL / keys 保持现有值。
+
+保存后对 Preview Deployment 执行：
+
+```text
+Redeploy
+```
+
+环境变量变化不会自动进入已经完成的旧 Deployment。
+
+---
+
+## 九、检查现有 Vercel Environment Variables
+
+Production 应继续保留：
 
 ```text
 VITE_SUPABASE_URL
@@ -118,106 +395,137 @@ ADMIN_PIN
 SESSION_SECRET
 ```
 
-三个 slug 必须继续对应同一赛事：
+旧项目也可以继续使用：
 
 ```text
-VITE_EVENT_SLUG = EVENT_SLUG = tournaments.slug
+SUPABASE_SERVICE_ROLE_KEY
 ```
 
-默认值：
+正式环境必须满足：
+
+```text
+VITE_EVENT_SLUG = EVENT_SLUG = public.tournaments.slug
+```
+
+通常是：
 
 ```text
 wulin-annual-2026
 ```
 
-不要把 `SUPABASE_SECRET_KEY` 改成以 `VITE_` 开头；浏览器只能使用 publishable key。
+不要把 Secret / Service Role key 放入任何 `VITE_` 变量。`VITE_` 变量会进入浏览器 bundle。
 
-如果你修改了任何 Vercel Environment Variable，保存后必须创建新的 deployment 或 Redeploy；旧 deployment 不会自动得到新变量。
-
----
-
-## D. Vercel 自动部署
-
-如果 Vercel 已连接 GitHub：
-
-1. Push branch 后，Vercel 自动建立 Preview Deployment。
-2. 打开 Vercel Project → Deployments。
-3. 等待 Build 状态变成 Ready。
-4. 在 Preview URL 先做测试。
-5. Merge 到 Production branch 后，Vercel 自动更新正式域名。
-
-若 Build 失败：
-
-1. 打开失败 Deployment。
-2. 查看 Build Logs。
-3. 确认 Framework 是 Vite。
-4. Build Command 应为：
-
-```text
-npm run build
-```
-
-5. Output Directory 应为：
-
-```text
-dist
-```
+v8 没有新增环境变量。
 
 ---
 
-## E. Supabase 是否要运行 SQL？
+## 十、Preview 验收
 
-### 已有云端版
-
-**不用重新运行 `schema.sql`。**
-
-现有表、RLS、RPC、history 和 Realtime publication 都与 v6 相容。直接更新前端和 Vercel Functions 即可。
-
-升级后可运行：
+### TV 1
 
 ```text
-supabase/verify_v6_update.sql
+https://PREVIEW_DOMAIN/?view=operations
 ```
 
-在第一次 v6 后台保存前，`app_state_version` 或 `on_deck_limit` 可能仍显示旧值或 null，这是正常的；v6 浏览器已经在读取时补齐默认值。第一次保存后会显示：
+检查：
+
+- Active Cat 各自显示 Done / Total；
+- 各自显示 Queue；
+- 有进行中比赛时显示 Live；
+- On Deck Expected Court 字体更大；
+- iPad landscape 一屏同时看到 On Deck 和 6 Live Courts；
+- Court + Category + Pool 自动 On Deck 仍正常。
+
+### TV 2
 
 ```text
-app_state_version = 6
-on_deck_limit = 6
+https://PREVIEW_DOMAIN/?view=results
 ```
 
-### 全新 Supabase Project
+检查：
 
-只有新建项目时才运行完整：
+- 原有 Pool standings；
+- H2H 排名；
+- 两 Pool crossover；
+- Playoff branch；
+- 三 Pool 6 Seeds 生成后，Bracket 为 QF → SF → Final；
+- Seed 1 / 2 直接出现在 SF。
+
+### Admin
 
 ```text
-supabase/schema.sql
+https://PREVIEW_DOMAIN/?view=admin
 ```
+
+检查：
+
+- 6 Court 横向中控；
+- Category + Pool Routes；
+- Manual On Deck + Potential Court；
+- Category / Pool Tabs；
+- 三 Pool Cross-Pool Seed Table；
+- Move Up / Move Down；
+- Reset Auto；
+- Score Corrections 位于页面最后；
+- Score Corrections 按 Category 折叠。
 
 ---
 
-## F. Preview 测试时避免改到正式比赛数据
+## 十一、三 Pool 功能验收步骤
 
-Vercel Preview 如果使用与 Production 完全相同的 Supabase 环境变量，Preview 后台也会修改正式数据库。
+在 Preview 使用一个拥有 3 Pools 的 Category：
 
-安全选择有两个：
+1. 每个 Pool 的 `PLAYOFF QUALIFIERS` 设为 `2`；
+2. 完成或输入足够 RR 分数；
+3. 打开该 Category 的 Playoff Settings；
+4. 查看六支队伍的自动 Seed 1–6；
+5. 检查列：
 
-1. Preview 只做公开页面和登录画面检查，不在后台保存；或
-2. 为 Preview 建立独立 Supabase 测试 project / 独立 event slug。
+```text
+PTS
+H2H / TB
+DIFF
+PF
+```
 
-最简单的正式升级方式是：先导出 JSON 备份，在 Preview 只检查布局，然后 merge；正式域名上线后再做完整后台操作测试。
+6. 检查路径：
+
+```text
+QF1 Seed 3 vs Seed 6
+QF2 Seed 4 vs Seed 5
+SF1 Seed 1 vs QF2 Winner
+SF2 Seed 2 vs QF1 Winner
+```
+
+7. 用 Move Up / Move Down 改变一个 Seed；
+8. 确认状态变为 `MANUAL ORDER`；
+9. 点击 `GENERATE PLAYOFF`；
+10. 在 Full Schedule 和 TV 2 检查真实对阵；
+11. 完成 QF2，确认胜者进入 Seed 1 的 SF；
+12. 完成 QF1，确认胜者进入 Seed 2 的 SF；
+13. 如开启 Third Place Match，确认两个 SF 败方进入 Bronze Match。
 
 ---
 
-## G. 正式域名上线后的逐项检查
+## 十二、Merge 正式上线
 
-先打开：
+Preview 全部通过后：
+
+1. GitHub Merge Pull Request；
+2. 等 Vercel 自动建立 Production Deployment；
+3. 确认状态：
 
 ```text
-https://你的域名/api/health
+Ready
 ```
 
-应看到：
+4. 打开：
+
+```text
+https://你的正式域名/api/health
+```
+
+正常结果应包括：
 
 ```json
 {
@@ -227,79 +535,164 @@ https://你的域名/api/health
 }
 ```
 
-然后检查四个页面：
+`version` 是 Supabase row version，每次成功保存增加一次，不需要等于 8。
+
+---
+
+## 十三、第一次正式 v8 保存
+
+登录正式 Admin，先确认旧数据仍在：
 
 ```text
-TV 1
-https://你的域名/?view=operations
-
-TV 2
-https://你的域名/?view=results
-
-完整赛程
-https://你的域名/?view=schedule
-
-后台
-https://你的域名/?view=admin
+Categories
+Pools
+Teams
+RR Scores
+Existing Playoff
+Courts
+Queue
+On Deck
 ```
 
-后台登录后：
-
-1. 确认原有 Cat、Pool、队伍和比分仍在。
-2. 在 Current Session 只启用当前上午或下午正在运行的 Cat。
-3. 检查每个 Court 的「可排」按钮。
-4. Court 3 等弹性场地可以勾选 `ALL ACTIVE`。
-5. 确认 Court 卡片和 Queue 显示 `RR ROUND x/y`。
-6. 把 On Deck 数量设为 3、4、5 或 6；默认 6。
-7. 在 TV 2 选择需要公开的 Cat。
-8. 等顶部显示：
+做一次无害修改：
 
 ```text
-实时同步 · vXX
+TV 1 On Deck Count：6 → 5 → 6
 ```
 
-9. 用另一台手机打开 TV 1 / TV 2，确认无需刷新就更新。
+等待顶部显示：
 
----
-
-## H. 旧数据升级后的默认逻辑
-
-旧云端状态没有 v6 字段时，系统会这样处理：
-
-- `prepareLimit`：默认 6；
-- `court.allowAllActive`：默认 false；
-- `cat.active`：已有 Court 分配或有正在进行比赛的 Cat 会自动设为 Active；其他 Cat 默认 Inactive；
-- 原有 `courtIds`、Queue、比分、排名和 Playoff 不会删除。
-
-上线后建议工作人员主动检查一次上午/下午 Active Cat，避免旧 Court 分配令不该运行的 Cat 被自动判断为 Active。
-
----
-
-## I. 回滚方法
-
-### Vercel Dashboard
-
-1. Project → Deployments。
-2. 找到上一版 Ready deployment。
-3. 使用 Promote / Rollback，或从 Git revert 后重新部署。
-
-### Git
-
-```bash
-git revert <v6-commit-sha>
-git push
+```text
+App state v8
+Synced with Supabase
 ```
 
-v6 新增字段都位于 JSONB 内；旧前端会忽略不认识的字段，因此代码回滚不会自动删除比赛数据。不过任何回滚前仍建议先导出 JSON。
+这次保存会把 normalize 后的 v8 JSONB state 写回原 event row。
 
 ---
 
-## J. 比赛当天建议
+## 十四、现有 Playoff 不会自动被替换
 
-- TV 1 固定打开 `?view=operations` 并全屏；
-- TV 2 固定打开 `?view=results`，选好 Cat 后全屏；
-- 工作人员电脑打开 `?view=admin`；
-- 比赛开始前导出一份 JSON；
-- 中午切换下午项目时先调整 Active Cats，再调整 Court 可排 Cat；
-- 看到「保存中」时不要连续刷新；等变成「实时同步」；
-- 若出现多人修改冲突，系统会载入云端最新版本，工作人员应重新执行刚才那一步。
+升级代码不会自动删除已经存在的 Playoff，因为旧 Playoff 可能已经有真实比分。
+
+对于需要应用新三 Pool 规则的 Category：
+
+1. 再导出一份 JSON；
+2. 打开 Category / Pool / Playoff Settings；
+3. 确认三个 Pool 每个出线 2 队；
+4. 检查自动跨 Pool Seeds；
+5. 必要时手动调整；
+6. 点击：
+
+```text
+GENERATE / REGENERATE PLAYOFF
+```
+
+7. 确认替换旧 Playoff。
+
+这一操作：
+
+- 保留 RR 赛程与 RR 比分；
+- 保留 Pool standings；
+- 删除该 Category 的旧 Playoff matches；
+- 删除旧 Playoff 分数；
+- 按 v8 Seeds 重新生成 QF / SF / Final / optional Bronze。
+
+旧 Playoff 分数需要按当天记录重新输入。
+
+---
+
+## 十五、Supabase 检查
+
+第一次正式 v8 保存后，在 Supabase SQL Editor 运行：
+
+```text
+supabase/verify_v8_update.sql
+```
+
+预期：
+
+```text
+app_state_version = 8
+court_count = 6
+categories_with_seed_order_field = category_count
+```
+
+`custom_six_seed_bracket_matches`：
+
+- 尚未生成三 Pool Playoff 时可以是 `0`；
+- 生成三 Pool Playoff 后应大于 `0`。
+
+还应看到：
+
+```text
+supabase_realtime | public | tournaments
+```
+
+---
+
+## 十六、两台电视与多设备 Realtime 测试
+
+设备 A：
+
+```text
+?view=admin
+```
+
+设备 B：
+
+```text
+?view=operations
+```
+
+设备 C：
+
+```text
+?view=results
+```
+
+从 Admin 执行：
+
+- 修改 Court Route；
+- 加入 On Deck；
+- 修改 Potential Court；
+- 输入比分；
+- 调整 Active Category；
+- 调整 On Deck Count。
+
+其他设备应无需手动刷新就更新。
+
+---
+
+## 十七、清理 Preview event
+
+正式版确认正常后，在 Supabase SQL Editor 运行：
+
+```text
+supabase/remove_v8_preview_event.sql
+```
+
+然后可以删除 Vercel Preview 专用的两个 slug 环境变量，或者留给下次测试。
+
+---
+
+## 十八、回滚
+
+### 代码回滚
+
+```text
+Vercel
+→ Deployments
+→ 找到升级前最后一个正常 Production Deployment
+→ Instant Rollback / Promote
+```
+
+### 数据回滚
+
+使用任一方法：
+
+1. Admin 导入升级前 JSON；
+2. 从 `tournament_state_history` 恢复升级前 snapshot；
+3. 再检查 Courts、Queue、On Deck、RR、Playoff。
+
+不要通过重新运行完整 `schema.sql` 恢复现有比赛。

@@ -1,9 +1,16 @@
 import { createClient } from "@supabase/supabase-js";
+import {
+  buildPlayoffBracketPlan as buildPlayoffBracketPlanCore,
+  computePoolStandings,
+  isPoolAllowed,
+  selectOnDeckEntries,
+} from "./tournament-core.js";
 import "./styles.css";
 
 const SUPABASE_URL = String(import.meta.env.VITE_SUPABASE_URL || "").trim();
 const SUPABASE_PUBLISHABLE_KEY = String(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || import.meta.env.VITE_SUPABASE_ANON_KEY || "").trim();
 const EVENT_SLUG = String(import.meta.env.VITE_EVENT_SLUG || "wulin-annual-2026").trim();
+const APP_STATE_VERSION = 8;
 const CACHE_KEY = `wulin_cloud_cache_${EVENT_SLUG}`;
 const CONFLICT_KEY = `wulin_cloud_conflict_${EVENT_SLUG}`;
 const LOGO_DATA = "/assets/Logo_New.jpg";
@@ -33,13 +40,20 @@ function escapeHtml(value){
 function normalizeState(raw){
   const base = createEmptyState();
   if (!raw || typeof raw !== "object") return base;
-  raw.version = 6;
+  raw.version = APP_STATE_VERSION;
   raw.settings = Object.assign(base.settings, raw.settings || {});
   raw.settings.courts = Array.isArray(raw.settings.courts) && raw.settings.courts.length ? raw.settings.courts : base.settings.courts;
   raw.settings.courts.forEach((court, idx) => {
     court.id = court.id || `court${idx+1}`;
     court.name = court.name || `Court ${idx+1}`;
     court.allowAllActive = !!court.allowAllActive;
+    court.poolAccess = court.poolAccess && typeof court.poolAccess === "object" && !Array.isArray(court.poolAccess)
+      ? court.poolAccess
+      : {};
+    Object.keys(court.poolAccess).forEach(catId => {
+      const poolIds = court.poolAccess[catId];
+      court.poolAccess[catId] = Array.isArray(poolIds) ? Array.from(new Set(poolIds.filter(Boolean))) : [];
+    });
   });
   raw.settings.dashboardCatIds = Array.isArray(raw.settings.dashboardCatIds) ? raw.settings.dashboardCatIds : [];
   raw.settings.prepareLimit = Math.max(3, Math.min(6, Number(raw.settings.prepareLimit || 6)));
@@ -51,6 +65,9 @@ function normalizeState(raw){
     cat.name = cat.name || "未命名 Cat";
     cat.status = cat.status || "rr";
     cat.playoffThirdPlace = ["bronze","margin"].includes(cat.playoffThirdPlace) ? cat.playoffThirdPlace : "margin";
+    cat.playoffSeedOrder = Array.isArray(cat.playoffSeedOrder)
+      ? Array.from(new Set(cat.playoffSeedOrder.filter(teamId => typeof teamId === "string" && teamId)))
+      : [];
     cat.courtIds = Array.isArray(cat.courtIds) ? cat.courtIds : [];
     cat.active = typeof cat.active === "boolean" ? cat.active : null;
     cat.pools = Array.isArray(cat.pools) ? cat.pools : [];
@@ -68,12 +85,30 @@ function normalizeState(raw){
         }
       });
     });
+    const categoryTeamIds = new Set(cat.pools.flatMap(pool => pool.teams.map(team => team.id)));
+    cat.playoffSeedOrder = cat.playoffSeedOrder.filter(teamId => categoryTeamIds.has(teamId));
   });
+  const categoryById = new Map(raw.categories.map(cat => [cat.id, cat]));
+  raw.settings.courts.forEach(court => {
+    const access = court.poolAccess || {};
+    Object.keys(access).forEach(catId => {
+      const cat = categoryById.get(catId);
+      if (!cat) {
+        delete access[catId];
+        return;
+      }
+      const validPoolIds = new Set(cat.pools.map(pool => pool.id));
+      access[catId] = (Array.isArray(access[catId]) ? access[catId] : []).filter(poolId => validPoolIds.has(poolId));
+      if (access[catId].length === validPoolIds.size && validPoolIds.size > 0) delete access[catId];
+    });
+  });
+  const courtIds = new Set(raw.settings.courts.map(court => court.id));
   raw.matches.forEach((m, idx) => {
     m.id = m.id || uid("match");
     m.status = m.status || "queued";
     m.hold = !!m.hold;
     m.sequence = Number.isFinite(Number(m.sequence)) ? Number(m.sequence) : idx + 1;
+    m.prepareCourtId = typeof m.prepareCourtId === "string" && courtIds.has(m.prepareCourtId) ? m.prepareCourtId : "";
   });
   raw.categories.forEach(cat => {
     if (cat.active === null) {
@@ -85,14 +120,14 @@ function normalizeState(raw){
 
 function createEmptyState(){
   return {
-    version: 6,
+    version: APP_STATE_VERSION,
     settings: {
       eventName: "武林年度赛 Tournament Control",
       autoNext: true,
       dashboardCatIds: [],
       prepareLimit: 6,
       prepareMatchIds: [],
-      courts: Array.from({length:6}, (_, i) => ({ id: "court" + (i+1), name: "Court " + (i+1), allowAllActive: false }))
+      courts: Array.from({length:6}, (_, i) => ({ id: "court" + (i+1), name: "Court " + (i+1), allowAllActive: false, poolAccess: {} }))
     },
     categories: [],
     matches: []
@@ -135,6 +170,7 @@ let adminCatFilter = "all";
 let adminSettingsCatId = "";
 let adminPoolTabByCat = {};
 let openCourtAccessId = "";
+let openScoreCorrectionCatIds = new Set();
 let toastTimer = null;
 
 function cacheState(snapshot = state, version = cloudVersion){
@@ -417,11 +453,14 @@ async function logoutAdmin(){
         s.categories[0].courtIds = ["court1","court2"];
         s.categories[1].courtIds = ["court3","court4"];
         s.categories[2].courtIds = ["court5","court6"];
-        const flexibleCourt = s.settings.courts.find(c => c.id === "court3");
-        if (flexibleCourt) flexibleCourt.allowAllActive = true;
-        s.categories.filter(cat => cat.active).forEach(cat => {
-          if (!cat.courtIds.includes("court3")) cat.courtIds.push("court3");
-        });
+        const court1 = s.settings.courts.find(c => c.id === "court1");
+        const court2 = s.settings.courts.find(c => c.id === "court2");
+        const court5 = s.settings.courts.find(c => c.id === "court5");
+        const court6 = s.settings.courts.find(c => c.id === "court6");
+        if (court1) court1.poolAccess[s.categories[0].id] = [s.categories[0].pools[0].id];
+        if (court2) court2.poolAccess[s.categories[0].id] = [s.categories[0].pools[1].id];
+        if (court5) court5.poolAccess[s.categories[2].id] = [s.categories[2].pools[0].id];
+        if (court6) court6.poolAccess[s.categories[2].id] = [s.categories[2].pools[1].id];
         s.categories.forEach(cat => generateRoundRobinForCat(s, cat.id, true));
 
         const markDone = (catId, count) => {
@@ -504,6 +543,7 @@ async function logoutAdmin(){
           active: true,
           status: "rr",
           playoffThirdPlace: "margin",
+          playoffSeedOrder: [],
           courtIds: [],
           pools: poolDefs.map((p, idx) => ({
             id: uid("pool"),
@@ -591,8 +631,19 @@ async function logoutAdmin(){
         const percent = total ? Math.round(done / total * 100) : 0;
         return { total, done, totalRounds, roundText, percent };
       }
+
+      function categoryOperationStats(catId){
+        const matches = state.matches.filter(m => m.catId === catId && m.teamAId !== "BYE" && m.teamBId !== "BYE");
+        const total = matches.length;
+        const done = matches.filter(m => m.status === "done").length;
+        const live = matches.filter(m => m.status === "playing").length;
+        const queued = matches.filter(m => m.status === "queued" && !m.hold).length;
+        const waiting = matches.filter(m => m.status === "waiting").length;
+        const percent = total ? Math.round(done / total * 100) : 0;
+        return { total, done, live, queued, waiting, percent };
+      }
       function statusLabel(status){
-        const map = { queued:"待安排", playing:"进行中", done:"已完成", waiting:"等胜者" };
+        const map = { queued:"QUEUED · 待安排", playing:"LIVE · 进行中", done:"FINAL · 已完成", waiting:"WAITING · 等胜者" };
         return map[status] || status;
       }
       function publicStatusLabel(status){
@@ -638,6 +689,19 @@ async function logoutAdmin(){
       function isMatchReady(m){
         return m.status === "queued" && !m.hold && !!m.teamAId && !!m.teamBId && m.teamAId !== "BYE" && m.teamBId !== "BYE";
       }
+      function isManualOnDeckEligible(m){
+        return isMatchReady(m);
+      }
+      function ensureCourtPoolAccess(court){
+        if (!court) return {};
+        if (!court.poolAccess || typeof court.poolAccess !== "object" || Array.isArray(court.poolAccess)) court.poolAccess = {};
+        return court.poolAccess;
+      }
+      function courtPoolSelection(court, catId){
+        const access = ensureCourtPoolAccess(court);
+        if (!Object.prototype.hasOwnProperty.call(access, catId)) return null; // null = all pools
+        return Array.isArray(access[catId]) ? access[catId] : [];
+      }
       function courtCanRunCat(courtId, catId){
         const cat = getCat(catId);
         const court = getCourt(courtId);
@@ -645,6 +709,17 @@ async function logoutAdmin(){
       }
       function courtHasCatAccess(court, cat){
         return !!court && !!cat && (cat.courtIds.includes(court.id) || (!!cat.active && !!court.allowAllActive));
+      }
+      function courtCanRunPool(courtId, catId, poolId){
+        const court = getCourt(courtId);
+        if (!courtCanRunCat(courtId, catId) || !court) return false;
+        if (!poolId) return true;
+        return isPoolAllowed(court.poolAccess, catId, poolId);
+      }
+      function courtCanRunMatch(courtId, match){
+        if (!match || !courtCanRunCat(courtId, match.catId)) return false;
+        if (match.stage !== "RR" || !match.poolId) return true;
+        return courtCanRunPool(courtId, match.catId, match.poolId);
       }
       function setCourtAllActive(courtId, checked){
         const court = getCourt(courtId);
@@ -660,6 +735,7 @@ async function logoutAdmin(){
         const court = getCourt(courtId);
         const cat = getCat(catId);
         if (!court || !cat) return;
+        ensureCourtPoolAccess(court);
         if (court.allowAllActive && !checked) {
           getActiveCats().forEach(activeCat => {
             if (!activeCat.courtIds.includes(courtId)) activeCat.courtIds.push(courtId);
@@ -671,26 +747,56 @@ async function logoutAdmin(){
         if (checked && !cat.courtIds.includes(courtId)) cat.courtIds.push(courtId);
         if (!checked) cat.courtIds = cat.courtIds.filter(id => id !== courtId);
       }
+      function setCourtAllPools(courtId, catId, checked){
+        const court = getCourt(courtId);
+        const cat = getCat(catId);
+        if (!court || !cat) return;
+        const access = ensureCourtPoolAccess(court);
+        if (checked) delete access[catId];
+        else access[catId] = [];
+      }
+      function setCourtPoolAccess(courtId, catId, poolId, checked){
+        const court = getCourt(courtId);
+        const cat = getCat(catId);
+        if (!court || !cat || !poolId) return;
+        if (!courtHasCatAccess(court, cat)) setCourtCatAccess(courtId, catId, true);
+        const allPoolIds = cat.pools.map(pool => pool.id);
+        const access = ensureCourtPoolAccess(court);
+        let selected = courtPoolSelection(court, catId);
+        if (selected === null) selected = allPoolIds.slice();
+        else selected = selected.slice();
+        if (checked && !selected.includes(poolId)) selected.push(poolId);
+        if (!checked) selected = selected.filter(id => id !== poolId);
+        selected = selected.filter(id => allPoolIds.includes(id));
+        if (selected.length === allPoolIds.length) delete access[catId];
+        else access[catId] = selected;
+      }
+      function configuredCourtsForMatch(m){
+        if (!m) return [];
+        const cat = getCat(m.catId);
+        if (!cat || !cat.active) return [];
+        return state.settings.courts.filter(court => courtCanRunMatch(court.id, m));
+      }
       function emptyCourts(){
         return state.settings.courts.filter(c => !currentPlayingByCourt(c.id));
       }
-      function eligibleMatchesForCourt(courtId, catFilter="all"){
+      function eligibleMatchesForCourt(courtId, catFilter="all", reservedTeamIds=null){
         const busy = playingTeamIds();
+        const reserved = reservedTeamIds || new Set();
         return state.matches
           .filter(m => isMatchReady(m))
           .filter(m => getCat(m.catId)?.active)
           .filter(m => catFilter === "all" || m.catId === catFilter)
-          .filter(m => courtCanRunCat(courtId, m.catId))
+          .filter(m => courtCanRunMatch(courtId, m))
           .filter(m => !busy.has(m.teamAId) && !busy.has(m.teamBId))
-          .sort(sortByPriorityThenMatches);
+          .filter(m => !reserved.has(m.teamAId) && !reserved.has(m.teamBId))
+          .sort((a,b) => sortByPriorityForCourt(a,b,courtId));
       }
       function eligibleCourtsForMatch(m){
         if (!isMatchReady(m)) return [];
         const busy = playingTeamIds();
         if (busy.has(m.teamAId) || busy.has(m.teamBId)) return [];
-        const cat = getCat(m.catId);
-        if (!cat || !cat.active) return [];
-        return emptyCourts().filter(c => courtCanRunCat(c.id, cat.id));
+        return emptyCourts().filter(c => courtCanRunMatch(c.id, m));
       }
       function sortMatches(a,b){
         const catA = state.categories.findIndex(c => c.id === a.catId);
@@ -714,19 +820,28 @@ async function logoutAdmin(){
         return sortMatches(a,b);
       }
 
+      function sortByPriorityForCourt(a,b,courtId){
+        const aPlanned = a.prepareCourtId === courtId ? 0 : 1;
+        const bPlanned = b.prepareCourtId === courtId ? 0 : 1;
+        if (aPlanned !== bPlanned) return aPlanned - bPlanned;
+        return sortByPriorityThenMatches(a,b);
+      }
+
       function cleanPrepareMatchIds(){
         const seen = new Set();
         state.settings.prepareMatchIds = (state.settings.prepareMatchIds || []).filter(id => {
           if (seen.has(id)) return false;
           seen.add(id);
           const m = getMatch(id);
-          return !!m && isMatchReady(m) && !!getCat(m.catId)?.active;
+          if (!m || !isManualOnDeckEligible(m) || !getCat(m.catId)?.active) return false;
+          if (m.prepareCourtId && !getCourt(m.prepareCourtId)) m.prepareCourtId = "";
+          return true;
         }).slice(0, 12);
       }
 
       function setPrepareMatch(matchId, toTop=false){
         const m = getMatch(matchId);
-        if (!m || !isMatchReady(m)) return false;
+        if (!m || !isManualOnDeckEligible(m)) return false;
         cleanPrepareMatchIds();
         state.settings.prepareMatchIds = (state.settings.prepareMatchIds || []).filter(id => id !== matchId);
         if (toTop) state.settings.prepareMatchIds.unshift(matchId);
@@ -765,43 +880,13 @@ async function logoutAdmin(){
 
       function nextPrepareMatches(limit=state.settings.prepareLimit || 6){
         cleanPrepareMatchIds();
-        limit = Math.max(3, Math.min(6, Number(limit || 6)));
-        const activeCatIds = getActiveCatIds();
-        const busy = playingTeamIds();
-        const reservedTeams = new Set(busy);
-        const chosen = [];
-        const manualIds = new Set(state.settings.prepareMatchIds || []);
-
-        const tryAdd = (m) => {
-          if (!m || !isMatchReady(m) || !getCat(m.catId)?.active) return false;
-          if (reservedTeams.has(m.teamAId) || reservedTeams.has(m.teamBId)) return false;
-          chosen.push(m);
-          reservedTeams.add(m.teamAId);
-          reservedTeams.add(m.teamBId);
-          return true;
-        };
-
-        // Staff priority always comes first, while avoiding duplicate players on the same call board.
-        (state.settings.prepareMatchIds || []).map(id => getMatch(id)).forEach(m => {
-          if (chosen.length < limit) tryAdd(m);
+        return selectOnDeckEntries({
+          matches: state.matches,
+          categories: state.categories,
+          courts: state.settings.courts,
+          manualMatchIds: state.settings.prepareMatchIds,
+          limit
         });
-
-        // Then interleave active categories so six courts receive a balanced, useful call list.
-        const queues = activeCatIds.map(catId => state.matches
-          .filter(m => m.catId === catId && isMatchReady(m) && !manualIds.has(m.id))
-          .sort(sortMatches));
-        let progressed = true;
-        while (chosen.length < limit && progressed){
-          progressed = false;
-          for (const queue of queues){
-            while (queue.length){
-              const candidate = queue.shift();
-              if (tryAdd(candidate)) { progressed = true; break; }
-            }
-            if (chosen.length >= limit) break;
-          }
-        }
-        return chosen;
       }
 
       function renderAll(){
@@ -821,27 +906,36 @@ async function logoutAdmin(){
       }
 
       function renderOperations(){
-        const activeCatIds = new Set(getActiveCatIds());
-        const activeMatches = state.matches.filter(m => activeCatIds.has(m.catId));
+        const activeCats = getActiveCats();
         const playing = state.matches.filter(m => m.status === "playing");
-        const done = activeMatches.filter(m => m.status === "done").length;
-        const total = activeMatches.length;
-        const queued = activeMatches.filter(m => m.status === "queued" && !m.hold).length;
         const prepareLimit = Math.max(3, Math.min(6, Number(state.settings.prepareLimit || 6)));
         const prepare = nextPrepareMatches(prepareLimit);
 
         $("view-operations").innerHTML = `
           <section class="panel tv-banner">
-            <div>
-              <div class="eyebrow">LIVE OPERATIONS · 赛事实况</div>
-              <h2>COURTS & ON DECK</h2>
-              <p>Players: check your court now and stay nearby when your match appears in On Deck. · 请留意场地与候场叫号</p>
+            <div class="tv-banner-topline">
+              <div>
+                <div class="eyebrow">LIVE OPERATIONS · 赛事实况</div>
+                <h2>COURTS & ON DECK</h2>
+              </div>
+              <div class="tv-stat-row compact">
+                <div class="tv-stat"><b>${playing.length}/${state.settings.courts.length}</b><span>LIVE COURTS</span></div>
+                <div class="tv-stat"><b>${prepare.length}</b><span>ON DECK</span></div>
+              </div>
             </div>
-            <div class="tv-stat-row">
-              <div class="tv-stat"><b>${playing.length}/${state.settings.courts.length}</b><span>LIVE COURTS</span></div>
-              <div class="tv-stat"><b>${prepare.length}</b><span>ON DECK</span></div>
-              <div class="tv-stat"><b>${done}/${total || 0}</b><span>COMPLETED</span></div>
-              <div class="tv-stat"><b>${queued}</b><span>IN QUEUE</span></div>
+            <div class="session-category-progress" aria-label="Active category progress">
+              ${activeCats.length ? activeCats.map(cat => {
+                const stats = categoryOperationStats(cat.id);
+                return `<div class="session-category-card" title="${escapeHtml(cat.name)}">
+                  <div class="session-category-name">${escapeHtml(cat.name)}</div>
+                  <div class="session-category-metrics">
+                    <span><b>${stats.done}/${stats.total}</b> DONE</span>
+                    <span><b>${stats.queued}</b> QUEUE</span>
+                    ${stats.live ? `<span class="live"><b>${stats.live}</b> LIVE</span>` : ""}
+                  </div>
+                  <div class="session-category-track"><span style="width:${stats.percent}%"></span></div>
+                </div>`;
+              }).join("") : `<div class="session-category-empty">No active categories · 当前没有 Active Cat</div>`}
             </div>
           </section>
 
@@ -855,7 +949,7 @@ async function logoutAdmin(){
                 <span class="pill gold">${prepare.length}/${prepareLimit} READY</span>
               </div>
               <div class="on-deck-grid">
-                ${prepare.length ? prepare.map((m, idx) => renderPrepareCard(m, idx)).join("") : `<div class="empty-state" style="grid-column:1/-1">No match is ready for On Deck right now. · 暂无候场比赛</div>`}
+                ${prepare.length ? prepare.map((entry, idx) => renderPrepareCard(entry, idx)).join("") : `<div class="empty-state" style="grid-column:1/-1">No match is ready for On Deck right now. · 暂无候场比赛</div>`}
               </div>
             </section>
 
@@ -923,20 +1017,31 @@ async function logoutAdmin(){
         `;
       }
 
-      function renderPrepareCard(m, idx){
+      function renderPrepareCard(entry, idx){
+        const m = entry?.match || entry;
         const cat = getCat(m.catId);
         const pool = getPool(m.catId, m.poolId);
-        const courtNames = eligibleCourtsForMatch(m).map(c => c.name).join(" / ");
-        const manual = (state.settings.prepareMatchIds || []).includes(m.id);
-        return `<article class="prepare-card">
+        const court = entry?.courtId ? getCourt(entry.courtId) : null;
+        const manual = !!entry?.manual || (state.settings.prepareMatchIds || []).includes(m.id);
+        const busyNote = entry?.teamsBusy
+          ? `<span class="pill red">FINISHING CURRENT MATCH · 正在比赛</span>`
+          : "";
+        return `<article class="prepare-card ${manual ? "manual" : "auto"}">
           <div class="num">${String(idx+1).padStart(2,"0")}</div>
-          <div>
-            <span class="pill gold">${escapeHtml(cat?.name || "Category")}</span>
-            <span class="pill round-focus">${escapeHtml(matchRoundLabel(m))}</span>${pool ? `<span class="pill">${escapeHtml(pool.name)}</span>` : ""}
-            ${manual ? `<span class="pill red">STAFF PRIORITY · 优先</span>` : `<span class="pill">AUTO QUEUE</span>`}
+          <div class="prepare-card-head">
+            <div class="prepare-tags">
+              <span class="pill gold">${escapeHtml(cat?.name || "Category")}</span>
+              <span class="pill round-focus">${escapeHtml(matchRoundLabel(m))}</span>${pool ? `<span class="pill">${escapeHtml(pool.name)}</span>` : ""}
+              ${manual ? `<span class="pill red">STAFF PRIORITY · 优先</span>` : `<span class="pill">AUTO BY COURT</span>`}
+              ${busyNote}
+            </div>
+            <div class="prepare-court-badge ${court ? "assigned" : "pending"}">
+              <span>PREPARE FOR</span>
+              <strong>${court ? escapeHtml(court.name) : "COURT TBD"}</strong>
+            </div>
           </div>
           ${matchTeamsHtml(m)}
-          <div class="subtle">Match ${escapeHtml(matchCode(m))} · Eligible courts: ${courtNames ? escapeHtml(courtNames) : "waiting for an assigned open court · 等待场地"}</div>
+          <div class="subtle">Match ${escapeHtml(matchCode(m))} · ${court ? `Expected court assignment · 预计 ${escapeHtml(court.name)}` : "Staff will confirm the court · 等待场地确认"}</div>
         </article>`;
       }
 
@@ -948,38 +1053,61 @@ async function logoutAdmin(){
         const compactSummary = court.allowAllActive
           ? `ALL ${activeCats.length}`
           : (effectiveCount ? `${effectiveCount}/${activeCats.length}` : `0/${activeCats.length}`);
-        const selectedNames = court.allowAllActive
-          ? "全部当前项目"
-          : (selectedCats.length ? selectedCats.map(cat => cat.name).join(" · ") : "未开放");
+        const catSummary = (cat) => {
+          const selected = courtPoolSelection(court, cat.id);
+          if (selected === null) return `${cat.name}: All Pools`;
+          if (!selected.length) return `${cat.name}: No RR Pool`;
+          const names = cat.pools.filter(pool => selected.includes(pool.id)).map(pool => pool.name);
+          return `${cat.name}: ${names.join(" / ") || "No RR Pool"}`;
+        };
+        const selectedNames = selectedCats.length ? selectedCats.map(catSummary).join(" · ") : "Not assigned";
         return `<div class="court-access compact ${isOpen ? "open" : ""}">
           <button type="button" class="court-access-trigger" data-action="toggle-court-access" data-court-id="${court.id}" title="${escapeHtml(selectedNames)}">
-            <span class="court-access-trigger-label">可排</span>
+            <span class="court-access-trigger-label">ACCESS</span>
             <span class="court-access-trigger-value ${court.allowAllActive ? "all" : ""}">${escapeHtml(compactSummary)}</span>
             <span class="court-access-chevron">▾</span>
           </button>
-          <div class="court-access-menu">
+          <div class="court-access-menu pool-aware">
             <div class="court-access-menu-head">
               <div>
-                <div class="court-access-title">Assignable Active Cats · 可排项目</div>
+                <div class="court-access-title">Court Assignment Rules · 场地权限</div>
                 <div class="court-access-current" title="${escapeHtml(selectedNames)}">${escapeHtml(selectedNames)}</div>
               </div>
-              <button type="button" class="ghost tiny" data-action="close-court-access">完成</button>
+              <button type="button" class="ghost tiny" data-action="close-court-access">DONE · 完成</button>
             </div>
-            <div class="court-access-options">
-              <label class="mini-check ${court.allowAllActive ? "active" : ""}">
-                <input type="checkbox" data-action="court-all-active-toggle" data-court-id="${court.id}" ${court.allowAllActive ? "checked" : ""}>
-                <span>ALL ACTIVE · 全部</span>
-              </label>
+            <label class="mini-check ${court.allowAllActive ? "active" : ""}">
+              <input type="checkbox" data-action="court-all-active-toggle" data-court-id="${court.id}" ${court.allowAllActive ? "checked" : ""}>
+              <span>ALL ACTIVE CATEGORIES · 全部项目</span>
+            </label>
+            <div class="court-access-cat-list">
               ${activeCats.map(cat => {
                 const checked = courtHasCatAccess(court, cat);
                 const progress = categoryProgress(cat.id);
-                return `<label class="mini-check ${checked ? "active" : ""}" title="${escapeHtml(cat.name)} · ${escapeHtml(progress.roundText)}">
-                  <input type="checkbox" data-action="court-cat-toggle" data-court-id="${court.id}" data-cat-id="${cat.id}" ${checked ? "checked" : ""}>
-                  <span>${escapeHtml(cat.name)}</span><span class="access-progress">${escapeHtml(progress.roundText.replace("RR ", ""))}</span>
-                </label>`;
+                const selectedPools = courtPoolSelection(court, cat.id);
+                const allPools = selectedPools === null;
+                return `<div class="court-access-cat-row ${checked ? "enabled" : "disabled"}">
+                  <label class="court-cat-master mini-check ${checked ? "active" : ""}" title="${escapeHtml(cat.name)} · ${escapeHtml(progress.roundText)}">
+                    <input type="checkbox" data-action="court-cat-toggle" data-court-id="${court.id}" data-cat-id="${cat.id}" ${checked ? "checked" : ""}>
+                    <span>${escapeHtml(cat.name)}</span><span class="access-progress">${escapeHtml(progress.roundText.replace("RR ", ""))}</span>
+                  </label>
+                  ${checked ? `<div class="pool-access-options">
+                    <label class="pool-chip ${allPools ? "active" : ""}">
+                      <input type="checkbox" data-action="court-all-pools-toggle" data-court-id="${court.id}" data-cat-id="${cat.id}" ${allPools ? "checked" : ""}>
+                      ALL POOLS
+                    </label>
+                    ${cat.pools.map(pool => {
+                      const poolChecked = allPools || selectedPools.includes(pool.id);
+                      return `<label class="pool-chip ${poolChecked ? "active" : ""}">
+                        <input type="checkbox" data-action="court-pool-toggle" data-court-id="${court.id}" data-cat-id="${cat.id}" data-pool-id="${pool.id}" ${poolChecked ? "checked" : ""}>
+                        ${escapeHtml(pool.name)}
+                      </label>`;
+                    }).join("")}
+                  </div>` : `<div class="pool-access-disabled">Enable the category to choose Pool A / Pool B.</div>`}
+                </div>`;
               }).join("")}
-              ${activeCats.length ? "" : `<span class="subtle">请先在 Current Session 勾选 Active Cat。</span>`}
+              ${activeCats.length ? "" : `<span class="subtle">Select Active Categories in Current Session first. · 请先开启当前项目</span>`}
             </div>
+            <div class="court-access-note">Pool rules apply to Round Robin. Playoff matches may use any court enabled for the category. · Pool 限制只用于小组赛</div>
           </div>
         </div>`;
       }
@@ -991,15 +1119,15 @@ async function logoutAdmin(){
           return `<article class="court-card empty ${admin ? "admin-court" : ""}">
             <div class="court-top">
               <h3>${escapeHtml(court.name)}</h3>
-              <div class="court-top-actions">${admin ? renderCourtAccess(court) : ""}<span class="pill empty">${admin ? "空场" : "OPEN · 空场"}</span></div>
+              <div class="court-top-actions">${admin ? renderCourtAccess(court) : ""}<span class="pill empty">${admin ? "OPEN · 空场" : "OPEN · 空场"}</span></div>
             </div>
             ${next ? `
-              <div class="public-label">${admin ? "下一场建议" : "NEXT AVAILABLE · 下一场"}</div>
+              <div class="public-label">${admin ? "NEXT MATCH · 下一场" : "NEXT AVAILABLE · 下一场"}</div>
               <div class="court-match-meta" style="margin-top:8px"><span class="pill gold">${escapeHtml(getCat(next.catId)?.name || "")}</span><span class="pill round-focus">${escapeHtml(matchRoundLabel(next))}</span>${getPool(next.catId,next.poolId) ? `<span class="pill">${escapeHtml(getPool(next.catId,next.poolId).name)}</span>` : ""}</div>
               ${matchTeamsHtml(next, true)}
-              ${admin ? `<button class="success" data-action="assign-match" data-match-id="${next.id}" data-court-id="${court.id}">安排到此场</button>` : `<div class="subtle">Awaiting staff confirmation · 等待工作人员安排</div>`}
+              ${admin ? `<button class="success" data-action="assign-match" data-match-id="${next.id}" data-court-id="${court.id}">ASSIGN TO COURT · 安排</button>` : `<div class="subtle">Awaiting staff confirmation · 等待工作人员安排</div>`}
             ` : `
-              <div class="empty-state">${admin ? "没有可立即安排的 Active Cat 比赛。可在本卡片上方直接修改此场地可排项目。" : "No match is ready for this court. · 暂无可安排比赛"}</div>
+              <div class="empty-state">${admin ? "No eligible match is ready. Adjust Category / Pool access above. · 可修改项目小组权限" : "No match is ready for this court. · 暂无可安排比赛"}</div>
             `}
           </article>`;
         }
@@ -1008,20 +1136,20 @@ async function logoutAdmin(){
         return `<article class="court-card playing ${admin ? "admin-court" : ""}">
           <div class="court-top">
             <h3>${escapeHtml(court.name)}</h3>
-            <div class="court-top-actions">${admin ? renderCourtAccess(court) : ""}<span class="pill green">${admin ? "进行中" : "LIVE · 进行中"}</span></div>
+            <div class="court-top-actions">${admin ? renderCourtAccess(court) : ""}<span class="pill green">${admin ? "LIVE · 进行中" : "LIVE · 进行中"}</span></div>
           </div>
           <div class="court-match-meta"><span class="pill gold">${escapeHtml(cat?.name || "Category")}</span><span class="pill round-focus">${escapeHtml(matchRoundLabel(m))}</span>${pool ? `<span class="pill">${escapeHtml(pool.name)}</span>` : ""}</div>
-          ${admin && m.stage === "RR" ? `<div class="court-progress-note">此场是 ${escapeHtml(pool?.name || "Pool")} 的 Round ${Number(m.round || 0)}/${rrRoundTotal(m) || "?"}；可按进度在上方临时开放更多 Court。</div>` : ""}
+          ${admin && m.stage === "RR" ? `<div class="court-progress-note">${escapeHtml(pool?.name || "Pool")} · Round ${Number(m.round || 0)}/${rrRoundTotal(m) || "?"}. Open another court above if this pool needs to catch up. · 可临时加场</div>` : ""}
           ${matchTeamsHtml(m, true)}
           ${m.scoreA !== undefined && m.scoreA !== "" ? `<div class="court-score">${escapeHtml(m.scoreA)} : ${escapeHtml(m.scoreB)}</div>` : ""}
           ${admin ? `
             <div class="score-input-row">
-              <input id="scoreA_${m.id}" inputmode="numeric" placeholder="左队分" value="${escapeHtml(m.scoreA ?? "")}">
-              <input id="scoreB_${m.id}" inputmode="numeric" placeholder="右队分" value="${escapeHtml(m.scoreB ?? "")}">
+              <input id="scoreA_${m.id}" inputmode="numeric" placeholder="Team A score" value="${escapeHtml(m.scoreA ?? "")}">
+              <input id="scoreB_${m.id}" inputmode="numeric" placeholder="Team B score" value="${escapeHtml(m.scoreB ?? "")}">
             </div>
             <div class="queue-row-actions">
-              <button class="success" data-action="finish-match" data-match-id="${m.id}">完成并排下一场</button>
-              <button class="ghost" data-action="return-queue" data-match-id="${m.id}">退回队列</button>
+              <button class="success" data-action="finish-match" data-match-id="${m.id}">FINISH &amp; NEXT · 完成</button>
+              <button class="ghost" data-action="return-queue" data-match-id="${m.id}">RETURN TO QUEUE · 退回</button>
             </div>
           ` : `<div class="subtle">Match ${escapeHtml(matchCode(m))} · OFFICIAL ASSIGNMENT</div>`}
         </article>`;
@@ -1035,7 +1163,7 @@ async function logoutAdmin(){
             <div>
               <div class="eyebrow">ROUND ROBIN STANDINGS · 小组积分榜</div>
               <h2>${escapeHtml(cat.name)}</h2>
-              <div class="subtle">Win = 2 pts · Tie-break: point differential, then points for.</div>
+              <div class="subtle">Win = 2 pts · Tie-break: head-to-head, then point differential, then points for. · 同分先看交手</div>
             </div>
             <span class="pill ${cat.status === "playoff" ? "blue" : "gold"}">${cat.status === "playoff" ? "PLAYOFF" : "ROUND ROBIN"}</span>
           </div>
@@ -1043,11 +1171,11 @@ async function logoutAdmin(){
             const rows = computeStandings(cat.id, pool.id);
             return `<div class="pool-rank">
               <table>
-                <thead><tr><th colspan="8">${escapeHtml(pool.name)} · QUALIFIERS ${Number(pool.advance || 0)} · 出线 ${Number(pool.advance || 0)}</th></tr>
-                <tr><th>RANK</th><th>TEAM</th><th>P</th><th>W</th><th>L</th><th>PTS</th><th>DIFF</th><th>PF</th></tr></thead>
+                <thead><tr><th colspan="9">${escapeHtml(pool.name)} · QUALIFIERS ${Number(pool.advance || 0)} · 出线 ${Number(pool.advance || 0)}</th></tr>
+                <tr><th>RANK</th><th>TEAM</th><th>P</th><th>W</th><th>L</th><th>PTS</th><th>H2H / TB</th><th>DIFF</th><th>PF</th></tr></thead>
                 <tbody>
                   ${rows.map((r, idx) => `<tr class="${idx < Number(pool.advance || 0) ? "qualifier" : ""}">
-                    <td>${idx+1}</td><td><strong>${escapeHtml(r.name)}</strong></td><td>${r.played}</td><td>${r.wins}</td><td>${r.losses}</td><td>${r.points}</td><td>${r.diff > 0 ? "+" : ""}${r.diff}</td><td>${r.for}</td>
+                    <td>${idx+1}</td><td><strong>${escapeHtml(r.name)}</strong></td><td>${r.played}</td><td>${r.wins}</td><td>${r.losses}</td><td>${r.points}</td><td class="tiebreak-cell">${escapeHtml(r.tieBreakNote || "-")}</td><td>${r.diff > 0 ? "+" : ""}${r.diff}</td><td>${r.for}</td>
                   </tr>`).join("")}
                 </tbody>
               </table>
@@ -1095,7 +1223,7 @@ async function logoutAdmin(){
       }
 
       function thirdPlaceRuleLabel(cat){
-        return cat?.playoffThirdPlace === "bronze" ? "生成三四名赛" : "不打三四名赛 · 按半决赛败方输球分差";
+        return cat?.playoffThirdPlace === "bronze" ? "Play Third Place Match · 三四名赛" : "No Third Place Match · Rank semifinal losers by loss margin";
       }
 
       function computePodium(catId){
@@ -1136,13 +1264,109 @@ async function logoutAdmin(){
         return `${a} : ${b}`;
       }
 
-      function playoffSideHtml(m, side){
+      function playoffSeedLabel(m, side){
+        const seed = side === "A" ? m.seedA : m.seedB;
+        if (seed && seed.teamId && seed.teamId !== "BYE") {
+          const source = `${seed.poolName || "Pool"} #${seed.rank || "-"}`;
+          return seed.seedNumber ? `Seed ${seed.seedNumber} · ${source}` : source;
+        }
+        const fromId = side === "A" ? m.teamAFrom : m.teamBFrom;
+        const fromType = side === "A" ? m.teamAFromType : m.teamBFromType;
+        if (fromId) {
+          const source = getMatch(fromId);
+          return `${fromType === "loser" ? "Loser" : "Winner"} ${source ? matchCode(source) : "TBD"}`;
+        }
+        return "TBD";
+      }
+
+      function renderBracketSide(m, side){
         const id = side === "A" ? m.teamAId : m.teamBId;
+        const score = side === "A" ? m.scoreA : m.scoreB;
         const label = sideDisplay(m, side);
-        const cls = m.status === "done" && m.winnerId && id
-          ? (m.winnerId === id ? "winner-text" : "loser-text")
+        const resultClass = m.status === "done" && m.winnerId && id
+          ? (m.winnerId === id ? "winner" : "loser")
           : "";
-        return `<span class="${cls}">${escapeHtml(label)}</span>`;
+        return `<div class="bracket-side ${resultClass}">
+          <span class="bracket-seed">${escapeHtml(playoffSeedLabel(m, side))}</span>
+          <strong>${escapeHtml(label)}</strong>
+          <b class="bracket-score">${score === "" || score === undefined ? "-" : escapeHtml(score)}</b>
+        </div>`;
+      }
+
+      function bracketCenterY(match, baseStep, headerHeight){
+        if (Number.isFinite(Number(match.bracketY))) {
+          return headerHeight + baseStep * Number(match.bracketY);
+        }
+        const round = Math.max(1, Number(match.round || 1));
+        const index = Math.max(0, Number(match.bracketIndex || 0));
+        return headerHeight + baseStep * (index * Math.pow(2, round - 1) + Math.pow(2, round - 2));
+      }
+
+      function renderPlayoffBracket(catId){
+        const all = playoffMatchesForCat(catId);
+        const main = all.filter(m => m.stage !== "BR");
+        const bronze = all.find(m => m.stage === "BR");
+        if (!main.length) return `<div class="empty-state">PLAYOFF NOT STARTED · 淘汰赛尚未开始</div>`;
+
+        const totalRounds = Math.max(...main.map(m => Number(m.round || 1)));
+        const firstRoundCount = Math.max(1, main.filter(m => Number(m.round || 1) === 1).length);
+        const cardW = 248;
+        const cardH = 112;
+        const colGap = 92;
+        const headerHeight = 44;
+        const baseStep = firstRoundCount <= 2 ? 164 : 132;
+        const maxExplicitY = Math.max(0, ...main.map(m => Number.isFinite(Number(m.bracketY)) ? Number(m.bracketY) : 0));
+        const canvasHeight = Math.max(250, headerHeight + Math.max(firstRoundCount, maxExplicitY + .45) * baseStep + 12);
+        const canvasWidth = totalRounds * cardW + Math.max(0, totalRounds - 1) * colGap;
+        const byId = new Map(main.map(m => [m.id, m]));
+
+        const paths = main.filter(m => m.feedsTo && byId.has(m.feedsTo)).map(m => {
+          const next = byId.get(m.feedsTo);
+          const sx = (Number(m.round || 1) - 1) * (cardW + colGap) + cardW;
+          const sy = bracketCenterY(m, baseStep, headerHeight);
+          const tx = (Number(next.round || 1) - 1) * (cardW + colGap);
+          const ty = bracketCenterY(next, baseStep, headerHeight);
+          const mid = sx + (tx - sx) / 2;
+          return `<path d="M ${sx} ${sy} H ${mid} V ${ty} H ${tx}" />`;
+        }).join("");
+
+        const roundLabels = Array.from({length:totalRounds}, (_, idx) => {
+          const round = idx + 1;
+          const sample = main.find(m => Number(m.round || 1) === round);
+          const title = sample ? stageName(sample.stage) : `ROUND ${round}`;
+          return `<div class="bracket-round-title" style="left:${idx * (cardW + colGap)}px;width:${cardW}px">${escapeHtml(title)}</div>`;
+        }).join("");
+
+        const cards = main.map(m => {
+          const x = (Number(m.round || 1) - 1) * (cardW + colGap);
+          const centerY = bracketCenterY(m, baseStep, headerHeight);
+          const y = centerY - cardH / 2;
+          const court = m.courtId ? getCourt(m.courtId) : null;
+          return `<article class="bracket-match ${m.status === "done" ? "done" : m.status === "playing" ? "live" : ""}" style="left:${x}px;top:${y}px;width:${cardW}px;height:${cardH}px">
+            <div class="bracket-match-head">
+              <span>${escapeHtml(matchCode(m))}</span>
+              <span class="${statusClass(m.status)}"><i class="status-dot"></i>${escapeHtml(publicStatusLabel(m.status))}</span>
+            </div>
+            ${renderBracketSide(m,"A")}
+            ${renderBracketSide(m,"B")}
+            ${court ? `<div class="bracket-court">${escapeHtml(court.name)}</div>` : ""}
+          </article>`;
+        }).join("");
+
+        return `<div class="playoff-bracket-scroll">
+          <div class="playoff-bracket-canvas" style="width:${canvasWidth}px;height:${canvasHeight}px">
+            ${roundLabels}
+            <svg class="bracket-lines" width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" aria-hidden="true">${paths}</svg>
+            ${cards}
+          </div>
+          ${bronze ? `<div class="bronze-branch">
+            <div class="bronze-title">THIRD PLACE MATCH · 季军赛</div>
+            <article class="bracket-match bronze-card ${bronze.status === "done" ? "done" : bronze.status === "playing" ? "live" : ""}">
+              <div class="bracket-match-head"><span>${escapeHtml(matchCode(bronze))}</span><span class="${statusClass(bronze.status)}"><i class="status-dot"></i>${escapeHtml(publicStatusLabel(bronze.status))}</span></div>
+              ${renderBracketSide(bronze,"A")}${renderBracketSide(bronze,"B")}
+            </article>
+          </div>` : ""}
+        </div>`;
       }
 
       function renderPlayoffResultCard(catId){
@@ -1151,33 +1375,20 @@ async function logoutAdmin(){
         const matches = playoffMatchesForCat(catId);
         const done = matches.filter(m => m.status === "done").length;
         const podium = computePodium(catId);
-        return `<section class="panel rank-card">
+        return `<section class="panel rank-card playoff-result-card">
           <div class="panel-title">
             <div>
-              <div class="eyebrow">PLAYOFF RESULTS · 淘汰赛结果</div>
+              <div class="eyebrow">PLAYOFF BRACKET · 淘汰赛晋级图</div>
               <h2>${escapeHtml(cat.name)}</h2>
-              <div class="subtle">Live winners, advancement and official medal positions. · 晋级与颁奖名次</div>
+              <div class="subtle">Follow each semifinal branch into the Final. Winners are highlighted in green. · 胜者晋级</div>
             </div>
             <span class="pill blue">${done}/${matches.length} FINAL</span>
           </div>
           ${matches.length ? `
-            <div class="playoff-summary">
-              ${podium.length ? podium.map(p => `<span class="medal-card"><strong>${escapeHtml(p.label)}</strong>: ${escapeHtml(p.name)}</span>`).join("") : `<span class="medal-card">PLAYOFF IN PROGRESS · 淘汰赛进行中</span>`}
+            <div class="playoff-summary medal-strip">
+              ${podium.length ? podium.map(p => `<span class="medal-card"><strong>${escapeHtml(p.label)}</strong><span>${escapeHtml(p.name)}</span></span>`).join("") : `<span class="medal-card"><strong>PLAYOFF IN PROGRESS</strong><span>淘汰赛进行中</span></span>`}
             </div>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>STAGE</th><th>MATCHUP</th><th>SCORE</th><th>WINNER</th><th>STATUS</th></tr></thead>
-                <tbody>
-                  ${matches.map(m => `<tr>
-                    <td>${escapeHtml(stageName(m.stage))}</td>
-                    <td>${playoffSideHtml(m,"A")} vs ${playoffSideHtml(m,"B")}</td>
-                    <td>${escapeHtml(playoffScoreText(m))}</td>
-                    <td>${m.winnerId ? `<span class="winner-text">${escapeHtml(teamName(m.winnerId))}</span>` : "-"}</td>
-                    <td class="${statusClass(m.status)}"><span class="status-dot"></span>${escapeHtml(publicStatusLabel(m.status))}</td>
-                  </tr>`).join("")}
-                </tbody>
-              </table>
-            </div>
+            ${renderPlayoffBracket(catId)}
           ` : `<div class="empty-state">PLAYOFF NOT STARTED · 淘汰赛尚未开始</div>`}
         </section>`;
       }
@@ -1268,13 +1479,13 @@ async function logoutAdmin(){
             <section class="admin-gate">
               <div class="panel login-card">
                 <img src="${LOGO_DATA}" alt="Wulin">
-                <h2>后台管理</h2>
-                <p class="subtle">输入工作人员 PIN 后可以排场、录入比分、生成 Playoff、管理 Cat 和 Pool；所有修改会同步到 Supabase。</p>
+                <h2>STAFF ADMIN · 武林后台</h2>
+                <p class="subtle">Enter the staff PIN to assign courts, record scores, manage Categories / Pools and generate Playoffs. All changes sync to Supabase. · 工作人员专用</p>
                 <div style="margin:18px 0 10px">
-                  <input id="adminPassword" type="password" inputmode="numeric" placeholder="后台密码">
+                  <input id="adminPassword" type="password" inputmode="numeric" placeholder="Staff PIN">
                 </div>
-                <button class="primary" data-action="unlock-admin">打开后台</button>
-                <p class="subtle" style="margin-top:12px">工作人员 PIN 由 Vercel 的 <span class="kbd">ADMIN_PIN</span> 环境变量设置，不会写进前端代码。</p><div class="cloud-note">当前后台会话由 Vercel Function 签发 HttpOnly Cookie；Supabase Secret Key 只存在服务器环境变量中。</div>
+                <button class="primary" data-action="unlock-admin">OPEN STAFF ADMIN · 打开后台</button>
+                <p class="subtle" style="margin-top:12px">The staff PIN is stored in Vercel <span class="kbd">ADMIN_PIN</span>, not in the browser code.</p><div class="cloud-note">Secure HttpOnly staff session · Supabase Secret Key remains server-side. · 安全云端会话</div>
               </div>
             </section>`;
           return;
@@ -1284,7 +1495,7 @@ async function logoutAdmin(){
         if (adminCatFilter !== "all" && !activeCats.some(cat => cat.id === adminCatFilter)) adminCatFilter = "all";
         if (!state.categories.some(cat => cat.id === adminSettingsCatId)) adminSettingsCatId = activeCats[0]?.id || state.categories[0]?.id || "";
         const settingsCat = getCat(adminSettingsCatId);
-        const catOptions = [`<option value="all">全部 Active Cat</option>`].concat(activeCats.map(cat => `<option value="${cat.id}" ${adminCatFilter === cat.id ? "selected" : ""}>${escapeHtml(cat.name)}</option>`)).join("");
+        const catOptions = [`<option value="all">ALL ACTIVE CATEGORIES · 全部</option>`].concat(activeCats.map(cat => `<option value="${cat.id}" ${adminCatFilter === cat.id ? "selected" : ""}>${escapeHtml(cat.name)}</option>`)).join("");
         cleanPrepareMatchIds();
         const manualPrepare = (state.settings.prepareMatchIds || []).map(id => getMatch(id)).filter(Boolean);
         const queued = state.matches
@@ -1299,55 +1510,56 @@ async function logoutAdmin(){
           .filter(m => adminCatFilter === "all" || m.catId === adminCatFilter)
           .sort(sortMatches)
           .slice(0, 18);
-        const completed = state.matches
-          .slice()
-          .filter(m => m.status === "done" && m.teamAId !== "BYE" && m.teamBId !== "BYE" && !!getCat(m.catId)?.active)
-          .filter(m => adminCatFilter === "all" || m.catId === adminCatFilter)
-          .sort((a,b) => (Number(b.finishedAt || 0) - Number(a.finishedAt || 0)) || sortMatches(a,b))
-          .slice(0, 40);
+        const scoreCorrectionGroups = state.categories.map(cat => {
+          const matches = state.matches
+            .filter(m => m.catId === cat.id && m.status === "done" && m.teamAId !== "BYE" && m.teamBId !== "BYE")
+            .sort((a,b) => (Number(b.finishedAt || 0) - Number(a.finishedAt || 0)) || sortMatches(a,b));
+          return { cat, matches };
+        }).filter(group => group.matches.length > 0);
+        const completedCount = scoreCorrectionGroups.reduce((sum, group) => sum + group.matches.length, 0);
 
         $("view-admin").innerHTML = `
           <section class="panel">
             <div class="panel-title">
               <div>
-                <h2>后台排场与计分</h2>
-                <div class="subtle">比分以队伍为单位输入。完成比赛后会自动更新积分、释放场地，并可自动安排下一场。</div><div class="cloud-note">云端版本 v${cloudVersion || "-"} · ${pendingSave ? "有变更待同步" : "已与 Supabase 同步"} · 多设备同时修改时会用版本锁避免静默覆盖。</div>
+                <h2>STAFF TOURNAMENT CONTROL · 赛事中控</h2>
+                <div class="subtle">Enter team scores, control six courts and move the schedule forward from one screen. · 队伍计分与排场</div><div class="cloud-note">App state v${APP_STATE_VERSION} · Cloud record v${cloudVersion || "-"} · ${pendingSave ? "Changes waiting to sync · 待同步" : "Synced with Supabase · 已同步"} · Version lock protects against silent multi-device overwrites.</div>
               </div>
               <div class="admin-actions">
                 <button class="ghost" data-action="show-view" data-view="operations">TV 1 · Courts</button>
                 <button class="ghost" data-action="show-view" data-view="results">TV 2 · Results</button>
-                <button class="danger" data-action="logout-admin">锁定后台</button>
+                <button class="danger" data-action="logout-admin">LOCK ADMIN · 锁定</button>
               </div>
             </div>
             <div class="form-grid-4">
               <div>
-                <label>赛事名称</label>
+                <label>EVENT NAME · 赛事名称</label>
                 <input id="eventNameInput" data-action="event-name-input" value="${escapeHtml(state.settings.eventName)}">
               </div>
               <div>
-                <label>排场 Cat 筛选</label>
+                <label>QUEUE CATEGORY FILTER · 项目筛选</label>
                 <select id="adminCatFilter" data-action="admin-cat-filter">${catOptions}</select>
               </div>
               <div>
-                <label>自动排下一场</label>
+                <label>AUTO-ASSIGN NEXT MATCH · 自动下一场</label>
                 <select id="autoNextSelect" data-action="auto-next">
-                  <option value="true" ${state.settings.autoNext ? "selected" : ""}>开启：完成后自动排同 Cat 下一场</option>
-                  <option value="false" ${!state.settings.autoNext ? "selected" : ""}>关闭：只释放场地</option>
+                  <option value="true" ${state.settings.autoNext ? "selected" : ""}>ON · Finish and assign the next eligible match</option>
+                  <option value="false" ${!state.settings.autoNext ? "selected" : ""}>OFF · Release the court only</option>
                 </select>
               </div>
               <div>
-                <label>TV 1 · On Deck 显示数量</label>
+                <label>TV 1 · ON DECK COUNT · 候场数量</label>
                 <select id="prepareLimitSelect" data-action="prepare-limit">
                   ${[3,4,5,6].map(n => `<option value="${n}" ${Number(state.settings.prepareLimit || 6) === n ? "selected" : ""}>Next ${n} games</option>`).join("")}
                 </select>
               </div>
             </div>
             <div class="admin-actions" style="margin-top:12px">
-              <button class="success" data-action="fill-empty-courts">一键填满所有空场</button>
-              <button class="ghost" data-action="export-json">导出备份 JSON</button>
-              <button class="ghost" data-action="trigger-import">导入 JSON</button>
-              <button class="warn" data-action="load-sample">载入示例数据</button>
-              <button class="danger" data-action="clear-data">清空数据</button>
+              <button class="success" data-action="fill-empty-courts">FILL ALL OPEN COURTS · 填满空场</button>
+              <button class="ghost" data-action="export-json">EXPORT BACKUP JSON</button>
+              <button class="ghost" data-action="trigger-import">IMPORT JSON</button>
+              <button class="warn" data-action="load-sample">LOAD DEMO DATA</button>
+              <button class="danger" data-action="clear-data">CLEAR ALL DATA</button>
               <input id="importFile" type="file" accept="application/json" style="display:none">
             </div>
           </section>
@@ -1356,22 +1568,22 @@ async function logoutAdmin(){
             <div class="panel-title">
               <div>
                 <h2>CURRENT SESSION · 当前时段 Active Cats</h2>
-                <div class="subtle session-help">上午或下午切换时，只勾选当前正在运行的 Cat。Queue、自动排场、Court 可分配项目和 TV 1 候场都会只使用 Active Cat；完整赛程仍保留全部项目。</div>
+                <div class="subtle session-help">Select only the categories running in the current morning or afternoon session. Queue, auto-assignment, Court access and TV 1 use Active Categories only. · 当前时段项目</div>
               </div>
               <span class="pill green">${activeCats.length}/${state.categories.length} ACTIVE</span>
             </div>
             <div class="active-session-grid">
-              ${state.categories.length ? state.categories.map(renderActiveCatControl).join("") : `<div class="empty-state">请先新增 Cat。</div>`}
+              ${state.categories.length ? state.categories.map(renderActiveCatControl).join("") : `<div class="empty-state">Create a Category first. · 请先新增项目</div>`}
             </div>
           </section>
 
           <section class="panel court-control-panel">
             <div class="panel-title">
               <div>
-                <h2>6 个场地控制台</h2>
-                <div class="subtle">每个 Court 可直接勾选「ALL ACTIVE」或逐个 Active Cat，不需要再滚动到 Cat 设置修改。</div>
+                <h2>SIX-COURT CONTROL · 六场地中控</h2>
+                <div class="subtle">Open ACCESS on each court to choose Active Categories and Pool A / Pool B without leaving the control board. · 场边直接设置</div>
               </div>
-              <span class="pill">${state.matches.filter(m => m.status === "playing").length}/${state.settings.courts.length} 使用中</span>
+              <span class="pill">${state.matches.filter(m => m.status === "playing").length}/${state.settings.courts.length} IN PLAY</span>
             </div>
             <div class="admin-courts">
               ${state.settings.courts.map(c => renderCourtCard(c, true)).join("")}
@@ -1381,33 +1593,33 @@ async function logoutAdmin(){
           <section class="panel">
             <div class="panel-title">
               <div>
-                <h2>TV 1 · On Deck 候场队伍</h2>
-                <div class="subtle">人工指定的队伍会优先显示在大屏，也会优先被「一键填满空场 / 自动排下一场」安排。</div>
+                <h2>TV 1 · MANUAL ON DECK · 人工候场</h2>
+                <div class="subtle">Staff selections appear first on TV 1. Set a Potential Court so players know where to wait. Busy teams may remain listed for their next match. · 可预告场地</div>
               </div>
               <div class="admin-actions">
-                <span class="pill gold">显示前 ${Number(state.settings.prepareLimit || 6)} 场</span>
-                <button class="ghost" data-action="clear-prepare-list">清空人工准备</button>
+                <span class="pill gold">NEXT ${Number(state.settings.prepareLimit || 6)}</span>
+                <button class="ghost" data-action="clear-prepare-list">CLEAR MANUAL ON DECK</button>
               </div>
             </div>
             <div class="priority-list">
-              ${manualPrepare.length ? manualPrepare.map((m, idx) => renderPrepareControlRow(m, idx)).join("") : `<div class="empty-state">还没有人工指定。可在下方 Queue 点「加入准备」；如果少于设定数量，TV 1 会按自动赛程顺序补齐。</div>`}
+              ${manualPrepare.length ? manualPrepare.map((m, idx) => renderPrepareControlRow(m, idx)).join("") : `<div class="empty-state">No manual selections. Use ADD TO ON DECK in the Queue; remaining TV slots are filled automatically by Court + Category + Pool rules. · 自动补位</div>`}
             </div>
-            ${held.length ? `<div style="height:12px"></div><div class="panel-title"><h3>暂缓 / 找不到 / 时间冲突</h3><span class="pill red">${held.length}</span></div><div class="priority-list">${held.map(renderHeldRow).join("")}</div>` : ""}
+            ${held.length ? `<div style="height:12px"></div><div class="panel-title"><h3>HELD / PLAYER MISSING / CONFLICT · 暂缓</h3><span class="pill red">${held.length}</span></div><div class="priority-list">${held.map(renderHeldRow).join("")}</div>` : ""}
           </section>
 
           <section class="panel">
             <div class="panel-title">
               <div>
-                <h2>待安排队伍 Queue</h2>
-                <div class="subtle">只显示双方都已确定、且当前没有在其他场地比赛的队伍。可直接指定到大屏准备、置顶优先、或暂缓。</div>
+                <h2>MATCH QUEUE · 待安排</h2>
+                <div class="subtle">Add future matches to On Deck, pin priority, hold conflicts or assign directly to an eligible open court. Busy teams can still be added manually for a later match. · 后续赛程</div>
               </div>
               <span class="pill">${queued.length} shown</span>
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>#</th><th>Cat</th><th>Pool / RR Round</th><th>队伍</th><th>可安排场地</th></tr></thead>
+                <thead><tr><th>#</th><th>CATEGORY</th><th>POOL / RR ROUND</th><th>MATCHUP</th><th>ACTIONS / OPEN COURTS</th></tr></thead>
                 <tbody>
-                  ${queued.length ? queued.map((m, idx) => renderQueueRow(m, idx)).join("") : `<tr><td colspan="5"><div class="empty-state">没有可安排的下一场。可能在等 playoff 胜者、或 Cat 没有分配场地。</div></td></tr>`}
+                  ${queued.length ? queued.map((m, idx) => renderQueueRow(m, idx)).join("") : `<tr><td colspan="5"><div class="empty-state">No ready match under the current filter. Check waiting Playoff branches or Court Category / Pool access. · 暂无可排比赛</div></td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -1416,21 +1628,8 @@ async function logoutAdmin(){
           <section class="panel">
             <div class="panel-title">
               <div>
-                <h2>已完成比分修改</h2>
-                <div class="subtle">用于修正输入错误；Round Robin 会立刻重算排名，Playoff 胜者变更时会清空下游已受影响场次。</div>
-              </div>
-              <span class="pill">最近 ${completed.length} 场</span>
-            </div>
-            <div>
-              ${completed.length ? completed.map(renderCompletedScoreRow).join("") : `<div class="empty-state">当前筛选下还没有已完成比赛。</div>`}
-            </div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-title">
-              <div>
-                <h2>Cat / Pool / Playoff 设置</h2>
-                <div class="subtle">先点 Cat Tab，再点 Pool Tab；每次只展开一个设置页面，方便快速定位。</div>
+                <h2>CATEGORY / POOL / PLAYOFF SETTINGS · 赛事设置</h2>
+                <div class="subtle">Choose a Category tab, then a Pool tab. Only one settings page stays open for faster operation. · 分页设置</div>
               </div>
               ${settingsCat ? `<span class="pill ${settingsCat.active ? "green" : ""}">${settingsCat.active ? "ACTIVE" : "INACTIVE"}</span>` : ""}
             </div>
@@ -1438,29 +1637,29 @@ async function logoutAdmin(){
               ${state.categories.map(cat => `<button class="settings-tab ${cat.id === adminSettingsCatId ? "active" : ""}" data-action="cat-settings-tab" data-cat-id="${cat.id}"><span class="state-dot ${cat.active ? "active" : ""}"></span>${escapeHtml(cat.name)}</button>`).join("")}
             </div>
             <div class="cat-list single">
-              ${settingsCat ? renderCatCard(settingsCat) : `<div class="empty-state">还没有 Cat。请在下方新增。</div>`}
+              ${settingsCat ? renderCatCard(settingsCat) : `<div class="empty-state">No Category yet. Create one below. · 请新增项目</div>`}
             </div>
           </section>
 
           <section class="panel">
             <div class="panel-title">
               <div>
-                <h2>新增 Cat</h2>
-                <div class="subtle">队伍按行输入；多个 Pool 用空行分隔，每段第一行写 Pool 名称。</div>
+                <h2>ADD CATEGORY · 新增项目</h2>
+                <div class="subtle">Enter one team per line. Separate Pools with a blank line and place the Pool name on the first line. · 每队一行</div>
               </div>
             </div>
             <div class="form-grid">
               <div>
-                <label>Cat 名称</label>
-                <input id="newCatName" placeholder="例如：Adult Doubles B">
+                <label>CATEGORY NAME · 项目名称</label>
+                <input id="newCatName" placeholder="Example: Men's Doubles 4.0+">
               </div>
               <div>
-                <label>每个 Pool 默认出线人数</label>
+                <label>DEFAULT QUALIFIERS PER POOL · 每组出线</label>
                 <input id="newCatAdvance" type="number" min="1" value="2">
               </div>
             </div>
             <div style="height:10px"></div>
-            <label>Pool 与队伍</label>
+            <label>POOLS &amp; TEAMS · 小组队伍</label>
             <textarea id="newCatPools" spellcheck="false">Pool A
 队伍 1 / 队伍 2
 队伍 3 / 队伍 4
@@ -1471,20 +1670,46 @@ Pool B
 队伍 9 / 队伍 10
 队伍 11 / 队伍 12</textarea>
             <div class="admin-actions" style="margin-top:12px">
-              <button class="primary" data-action="add-cat">新增 Cat 并生成 RR</button>
+              <button class="primary" data-action="add-cat">ADD CATEGORY &amp; GENERATE RR · 新增</button>
             </div>
-            <div class="hint" style="margin-top:12px">格式示例：第一段是 Pool A，第二段是 Pool B。每一行就是一支队伍；本 app 会自动生成同 Pool 内的 round robin 赛程。</div>
+            <div class="hint" style="margin-top:12px">Example: Pool A in the first block, Pool B in the second. The app generates Round Robin matches inside each Pool. · 自动生成小组循环赛</div>
           </section>
 
           <section class="panel">
-            <div class="panel-title"><h2>场地名称</h2></div>
+            <div class="panel-title"><h2>COURT NAMES · 场地名称</h2></div>
             <div class="form-grid-3">
               ${state.settings.courts.map(c => `<div><label>${escapeHtml(c.id)}</label><input data-action="court-name-input" data-court-id="${c.id}" value="${escapeHtml(c.name)}"></div>`).join("")}
             </div>
             <div class="qr-dock">
-              <div class="subtle">可选展示二维码素材：</div>
+              <div class="subtle">Optional QR assets · 二维码：</div>
               <img src="${WECHAT_QR}" alt="WeChat QR">
               <img src="${COMMUNITY_QR}" alt="Community QR">
+            </div>
+          </section>
+
+          <section class="panel score-corrections-panel">
+            <div class="panel-title">
+              <div>
+                <h2>SCORE CORRECTIONS · 比分修正</h2>
+                <div class="subtle">This low-frequency tool is placed at the end of Admin. Open only the Category you need; RR standings recalculate immediately and a changed Playoff winner resets affected downstream branches. · 按项目展开</div>
+              </div>
+              <span class="pill">${completedCount} COMPLETED</span>
+            </div>
+            <div class="score-correction-groups">
+              ${scoreCorrectionGroups.length ? scoreCorrectionGroups.map(group => {
+                const rrCount = group.matches.filter(match => match.stage === "RR").length;
+                const playoffCount = group.matches.length - rrCount;
+                const isOpen = openScoreCorrectionCatIds.has(group.cat.id);
+                return `<details class="score-correction-group" data-score-correction-cat="${group.cat.id}" ${isOpen ? "open" : ""}>
+                  <summary>
+                    <span><strong>${escapeHtml(group.cat.name)}</strong><small>${group.matches.length} completed matches · ${rrCount} RR${playoffCount ? ` · ${playoffCount} Playoff` : ""}</small></span>
+                    <span class="pill">OPEN DETAILS · 展开</span>
+                  </summary>
+                  <div class="score-correction-body">
+                    ${group.matches.map(renderCompletedScoreRow).join("")}
+                  </div>
+                </details>`;
+              }).join("") : `<div class="empty-state">No completed matches are available for correction. · 暂无已完成比赛</div>`}
             </div>
           </section>
         `;
@@ -1497,26 +1722,40 @@ Pool B
       }
 
       function renderPrepareControlRow(m, idx){
+        const configured = configuredCourtsForMatch(m);
+        const busy = playingTeamIds();
+        const teamsBusy = busy.has(m.teamAId) || busy.has(m.teamBId);
+        const selectedCourt = m.prepareCourtId && configured.some(c => c.id === m.prepareCourtId) ? m.prepareCourtId : "";
         return `<article class="priority-card">
           <div class="priority-topline">
-            <div><span class="pill gold">#${idx+1}</span> <span class="pill">${renderMatchMeta(m)}</span></div>
+            <div><span class="pill gold">#${idx+1}</span> <span class="pill">${renderMatchMeta(m)}</span>${teamsBusy ? ` <span class="pill red">TEAM CURRENTLY PLAYING · 队伍比赛中</span>` : ""}</div>
             <div class="queue-row-actions">
-              <button class="small ghost" data-action="prepare-up" data-match-id="${m.id}">上移</button>
-              <button class="small ghost" data-action="prepare-down" data-match-id="${m.id}">下移</button>
-              <button class="small danger" data-action="unprepare-match" data-match-id="${m.id}">移除</button>
+              <button class="small ghost" data-action="prepare-up" data-match-id="${m.id}">MOVE UP</button>
+              <button class="small ghost" data-action="prepare-down" data-match-id="${m.id}">MOVE DOWN</button>
+              <button class="small danger" data-action="unprepare-match" data-match-id="${m.id}">REMOVE</button>
             </div>
           </div>
-          ${matchTeamsHtml(m, true)}
+          <div class="prepare-admin-grid">
+            <div>${matchTeamsHtml(m, true)}</div>
+            <div class="potential-court-control">
+              <label>Potential Court · 预计场地</label>
+              <select data-action="prepare-court-select" data-match-id="${m.id}">
+                <option value="" ${selectedCourt ? "" : "selected"}>AUTO / TO BE CONFIRMED</option>
+                ${configured.map(court => `<option value="${court.id}" ${selectedCourt === court.id ? "selected" : ""}>${escapeHtml(court.name)}</option>`).join("")}
+              </select>
+              <div class="subtle">TV 1 will show this as the expected court. Final assignment can still change.</div>
+            </div>
+          </div>
         </article>`;
       }
 
       function renderHeldRow(m){
         return `<article class="priority-card hold">
           <div class="priority-topline">
-            <div><span class="pill red">暂缓</span> <span class="pill">${renderMatchMeta(m)}</span></div>
+            <div><span class="pill red">HELD · 暂缓</span> <span class="pill">${renderMatchMeta(m)}</span></div>
             <div class="queue-row-actions">
-              <button class="small success" data-action="release-match" data-match-id="${m.id}">恢复到 Queue</button>
-              <button class="small warn" data-action="release-and-top" data-match-id="${m.id}">恢复并置顶</button>
+              <button class="small success" data-action="release-match" data-match-id="${m.id}">RETURN TO QUEUE · 恢复</button>
+              <button class="small warn" data-action="release-and-top" data-match-id="${m.id}">RESTORE &amp; PIN TOP · 置顶</button>
             </div>
           </div>
           ${matchTeamsHtml(m, true)}
@@ -1538,7 +1777,7 @@ Pool B
             <input id="editScoreB_${m.id}" inputmode="numeric" ${lockedAutoBye ? "disabled" : ""} value="${escapeHtml(m.scoreB ?? "")}">
           </div>
           <div class="queue-row-actions">
-            ${lockedAutoBye ? `<span class="pill">自动轮空</span>` : `<button class="small success" data-action="save-score-edit" data-match-id="${m.id}">保存修改</button>`}
+            ${lockedAutoBye ? `<span class="pill">AUTO BYE · 轮空</span>` : `<button class="small success" data-action="save-score-edit" data-match-id="${m.id}">SAVE CORRECTION · 保存</button>`}
           </div>
         </div>`;
       }
@@ -1557,13 +1796,94 @@ Pool B
           <td><strong>${escapeHtml(sideDisplay(m,"A"))}</strong> vs <strong>${escapeHtml(sideDisplay(m,"B"))}</strong></td>
           <td>
             <div class="queue-row-actions">
-              <button class="small warn" data-action="prepare-match" data-match-id="${m.id}">${prepared ? "已在准备" : "加入准备"}</button>
-              <button class="small ghost" data-action="prepare-top" data-match-id="${m.id}">置顶</button>
-              <button class="small danger" data-action="hold-match" data-match-id="${m.id}">暂缓</button>
-              ${blocked ? `<span class="pill red">队伍正在比赛</span>` : courts.length ? courts.map(c => `<button class="small success" data-action="assign-match" data-match-id="${m.id}" data-court-id="${c.id}">${escapeHtml(c.name)}</button>`).join("") : `<span class="pill empty">无空场 / 未分配场地</span>`}
+              <button class="small warn" data-action="prepare-match" data-match-id="${m.id}">${prepared ? "ON DECK · 已加入" : "ADD TO ON DECK · 候场"}</button>
+              <button class="small ghost" data-action="prepare-top" data-match-id="${m.id}">PIN TOP · 置顶</button>
+              <button class="small danger" data-action="hold-match" data-match-id="${m.id}">HOLD · 暂缓</button>
+              ${blocked ? `<span class="pill red">TEAM IN PLAY · 比赛中</span>` : courts.length ? courts.map(c => `<button class="small success" data-action="assign-match" data-match-id="${m.id}" data-court-id="${c.id}">${escapeHtml(c.name)}</button>`).join("") : `<span class="pill empty">NO OPEN ELIGIBLE COURT · 暂无场地</span>`}
             </div>
           </td>
         </tr>`;
+      }
+
+      function collectPlayoffQualifiers(cat){
+        if (!cat) return [];
+        const qualifiers = [];
+        cat.pools.forEach(pool => {
+          const standings = computeStandings(cat.id, pool.id);
+          const take = Math.max(0, Math.min(Number(pool.advance || 0), standings.length));
+          standings.slice(0, take).forEach((row, idx) => {
+            qualifiers.push({
+              teamId: row.teamId,
+              name: row.name,
+              poolId: pool.id,
+              poolName: pool.name,
+              rank: idx + 1,
+              points: row.points,
+              h2hPoints: row.h2hPoints,
+              tieBreakNote: row.tieBreakNote,
+              diff: row.diff,
+              scored: row.for
+            });
+          });
+        });
+        return qualifiers;
+      }
+
+      function getThreePoolSeedPlan(cat){
+        if (!cat || cat.pools.length !== 3 || !cat.pools.every(pool => Number(pool.advance || 0) === 2)) return null;
+        const qualifiers = collectPlayoffQualifiers(cat);
+        const plan = buildPlayoffBracketPlanCore(cat.pools, qualifiers, {
+          manualSeedOrder: cat.playoffSeedOrder || []
+        });
+        return plan.strategy === "three-pool-six-seed" ? plan : null;
+      }
+
+      function renderThreePoolSeedPanel(cat, plan){
+        if (!plan) return "";
+        const seeds = plan.ordered || [];
+        const manualRequested = Array.isArray(cat.playoffSeedOrder) && cat.playoffSeedOrder.length > 0;
+        const invalidManual = manualRequested && !plan.manualApplied;
+        const seedName = (index) => seeds[index]?.name || "TBD";
+        const seedSource = (seed) => `${seed?.poolName || "Pool"} #${seed?.rank || "-"}`;
+        return `<div class="three-pool-seeding-panel">
+          <div class="three-pool-seeding-head">
+            <div>
+              <strong>THREE-POOL CROSS-POOL SEEDING · 三组跨池排名</strong>
+              <div class="subtle">Auto order: Win Points → same-Pool Head-to-Head → Point Difference → Points For. Teams from different Pools have no direct H2H, so the comparison moves to DIFF/PF. · 可手动调整</div>
+            </div>
+            <div class="seed-mode-row">
+              <span class="pill ${plan.manualApplied ? "blue" : "gold"}">${plan.manualApplied ? "MANUAL ORDER" : "AUTO ORDER"}</span>
+              <button class="small ghost" data-action="reset-playoff-seeds" data-cat-id="${cat.id}">RESET AUTO</button>
+            </div>
+          </div>
+          ${invalidManual ? `<div class="sync-warning">The saved manual seed list no longer matches the current six qualifiers, so Auto Order is being used. · 出线队改变，已暂用自动排名</div>` : ""}
+          <div class="cross-pool-seed-table-wrap">
+            <table class="cross-pool-seed-table">
+              <thead><tr><th>SEED</th><th>TEAM</th><th>POOL RESULT</th><th>PTS</th><th>H2H / TB</th><th>DIFF</th><th>PF</th><th>PATH</th><th>MANUAL ORDER</th></tr></thead>
+              <tbody>${seeds.map((seed, index) => `<tr>
+                <td><span class="seed-number">${index + 1}</span></td>
+                <td><strong>${escapeHtml(seed.name)}</strong></td>
+                <td>${escapeHtml(seedSource(seed))}</td>
+                <td>${Number(seed.points || 0)}</td>
+                <td class="tiebreak-cell">${escapeHtml(seed.tieBreakNote || "-")}</td>
+                <td>${Number(seed.diff || 0) > 0 ? "+" : ""}${Number(seed.diff || 0)}</td>
+                <td>${Number(seed.scored || 0)}</td>
+                <td>${index < 2 ? `<span class="pill green">BYE TO SF</span>` : index === 2 ? "QF: Seed 3 vs 6" : index === 3 ? "QF: Seed 4 vs 5" : index === 4 ? "QF: Seed 4 vs 5" : "QF: Seed 3 vs 6"}</td>
+                <td><div class="seed-move-actions">
+                  <button class="tiny ghost" data-action="seed-up" data-cat-id="${cat.id}" data-team-id="${seed.teamId}" ${index === 0 ? "disabled" : ""}>↑</button>
+                  <button class="tiny ghost" data-action="seed-down" data-cat-id="${cat.id}" data-team-id="${seed.teamId}" ${index === seeds.length - 1 ? "disabled" : ""}>↓</button>
+                </div></td>
+              </tr>`).join("")}</tbody>
+            </table>
+          </div>
+          <div class="six-seed-path-preview">
+            <div><span>QUARTERFINAL 1</span><strong>Seed 3 · ${escapeHtml(seedName(2))}</strong><b>VS</b><strong>Seed 6 · ${escapeHtml(seedName(5))}</strong></div>
+            <div><span>QUARTERFINAL 2</span><strong>Seed 4 · ${escapeHtml(seedName(3))}</strong><b>VS</b><strong>Seed 5 · ${escapeHtml(seedName(4))}</strong></div>
+            <div><span>SEMIFINAL 1</span><strong>Seed 1 · ${escapeHtml(seedName(0))}</strong><b>VS</b><strong>Winner of Seed 4 vs 5</strong></div>
+            <div><span>SEMIFINAL 2</span><strong>Seed 2 · ${escapeHtml(seedName(1))}</strong><b>VS</b><strong>Winner of Seed 3 vs 6</strong></div>
+          </div>
+          <div class="hint">Move a team up or down, then click GENERATE / REGENERATE PLAYOFF to apply the displayed seed order. · 手动调整后需重新生成淘汰赛</div>
+        </div>`;
       }
 
       function renderCatCard(cat){
@@ -1574,7 +1894,18 @@ Pool B
         const rememberedPoolId = adminPoolTabByCat[cat.id];
         const selectedPool = cat.pools.find(pool => pool.id === rememberedPoolId) || cat.pools[0] || null;
         if (selectedPool) adminPoolTabByCat[cat.id] = selectedPool.id;
-        const selectedRows = selectedPool ? computeStandings(cat.id, selectedPool.id).slice(0, Math.max(4, Number(selectedPool.advance || 0))) : [];
+        const selectedRows = selectedPool ? computeStandings(cat.id, selectedPool.id) : [];
+        const standingsByPool = new Map(cat.pools.map(pool => [pool.id, computeStandings(cat.id, pool.id)]));
+        const poolA = cat.pools[0];
+        const poolB = cat.pools[1];
+        const poolARows = poolA ? (standingsByPool.get(poolA.id) || []) : [];
+        const poolBRows = poolB ? (standingsByPool.get(poolB.id) || []) : [];
+        const crossoverReady = cat.pools.length === 2 && Number(poolA?.advance || 0) >= 2 && Number(poolB?.advance || 0) >= 2;
+        const crossoverPreview = crossoverReady ? [
+          { label:"SEMIFINAL 1", left:`${poolA.name} #1 · ${poolARows[0]?.name || "TBD"}`, right:`${poolB.name} #2 · ${poolBRows[1]?.name || "TBD"}` },
+          { label:"SEMIFINAL 2", left:`${poolA.name} #2 · ${poolARows[1]?.name || "TBD"}`, right:`${poolB.name} #1 · ${poolBRows[0]?.name || "TBD"}` }
+        ] : [];
+        const threePoolSeedPlan = getThreePoolSeedPlan(cat);
         return `<article class="cat-card cat-settings-card">
           <div class="panel-title">
             <div>
@@ -1591,14 +1922,14 @@ Pool B
 
           <div class="inline-edit-grid">
             <div>
-              <label>Cat 名称（可随时修改）</label>
+              <label>CATEGORY NAME · 项目名称</label>
               <input class="compact-input" data-action="cat-name-input" data-cat-id="${cat.id}" value="${escapeHtml(cat.name)}">
             </div>
             <div>
-              <label>当前时段状态</label>
+              <label>CURRENT SESSION STATUS · 时段状态</label>
               <label class="mini-check ${cat.active ? "active" : ""}" style="margin-top:1px">
                 <input type="checkbox" data-action="cat-active-toggle" data-cat-id="${cat.id}" ${cat.active ? "checked" : ""}>
-                ${cat.active ? "Active：参与 Queue 与排场" : "Inactive：暂不参与排场"}
+                ${cat.active ? "ACTIVE · Included in Queue & Court assignment" : "INACTIVE · Excluded from current scheduling"}
               </label>
             </div>
           </div>
@@ -1610,28 +1941,28 @@ Pool B
           ${selectedPool ? `<div class="pool-rank selected-pool-editor">
             <div class="inline-edit-grid">
               <div>
-                <label>Pool 名称</label>
+                <label>POOL NAME · 小组名称</label>
                 <input class="compact-input" data-action="pool-name-input" data-cat-id="${cat.id}" data-pool-id="${selectedPool.id}" value="${escapeHtml(selectedPool.name)}">
               </div>
               <div>
-                <label>Playoff 出线人数</label>
+                <label>PLAYOFF QUALIFIERS · 出线人数</label>
                 <input class="compact-input" type="number" min="0" max="${Math.max(1, selectedPool.teams.length)}" data-action="pool-advance-input" data-cat-id="${cat.id}" data-pool-id="${selectedPool.id}" value="${Number(selectedPool.advance || 0)}">
               </div>
             </div>
             <div class="team-edit-grid">
-              ${selectedPool.teams.map((team, tIdx) => `<label class="team-edit-row"><span>队伍 ${tIdx+1}</span><input data-action="team-name-input" data-cat-id="${cat.id}" data-pool-id="${selectedPool.id}" data-team-id="${team.id}" value="${escapeHtml(team.name)}"></label>`).join("")}
+              ${selectedPool.teams.map((team, tIdx) => `<label class="team-edit-row"><span>TEAM ${tIdx+1}</span><input data-action="team-name-input" data-cat-id="${cat.id}" data-pool-id="${selectedPool.id}" data-team-id="${team.id}" value="${escapeHtml(team.name)}"></label>`).join("")}
             </div>
             <div class="pool-rank" style="margin-top:12px">
               <table>
-                <thead><tr><th colspan="5">${escapeHtml(selectedPool.name)} 当前排名</th></tr><tr><th>#</th><th>队伍</th><th>场</th><th>积分</th><th>净胜</th></tr></thead>
-                <tbody>${selectedRows.map((r,i) => `<tr class="${i < Number(selectedPool.advance || 0) ? "qualifier" : ""}"><td>${i+1}</td><td>${escapeHtml(r.name)}</td><td>${r.played}</td><td>${r.points}</td><td>${r.diff}</td></tr>`).join("")}</tbody>
+                <thead><tr><th colspan="9">${escapeHtml(selectedPool.name)} · FULL STANDINGS · 完整排名</th></tr><tr><th>#</th><th>TEAM</th><th>P</th><th>W</th><th>L</th><th>PTS</th><th>H2H / TB</th><th>DIFF</th><th>PF</th></tr></thead>
+                <tbody>${selectedRows.map((r,i) => `<tr class="${i < Number(selectedPool.advance || 0) ? "qualifier" : ""}"><td>${i+1}</td><td>${escapeHtml(r.name)}</td><td>${r.played}</td><td>${r.wins}</td><td>${r.losses}</td><td>${r.points}</td><td class="tiebreak-cell">${escapeHtml(r.tieBreakNote || "-")}</td><td>${r.diff > 0 ? "+" : ""}${r.diff}</td><td>${r.for}</td></tr>`).join("")}</tbody>
               </table>
             </div>
-          </div>` : `<div class="empty-state">这个 Cat 尚未建立 Pool。</div>`}
+          </div>` : `<div class="empty-state">No Pool has been created for this Category. · 尚未建立小组</div>`}
 
           <div class="settings-divider"></div>
           <div class="settings-section-title">Court Access · 场地分配</div>
-          <div class="subtle">日常临时调整建议直接在上方 Court 控制台操作；这里保留完整 Cat 角度的设置。</div>
+          <div class="subtle">Use the Court Control board above for live changes. This section keeps the Category-level overview. · 场地总览</div>
           <div class="court-checks">
             ${state.settings.courts.map(c => {
               const checked = courtHasCatAccess(c, cat);
@@ -1644,24 +1975,32 @@ Pool B
 
           <div class="settings-divider"></div>
           <div class="settings-section-title">Playoff Settings · 淘汰赛</div>
-          <div class="inline-edit-grid">
+          ${threePoolSeedPlan ? renderThreePoolSeedPanel(cat, threePoolSeedPlan) : crossoverReady ? `<div class="hint playoff-seeding-hint"><strong>TWO-POOL CROSSOVER · 交叉半决赛</strong><div class="crossover-preview">${crossoverPreview.map(row => `<div class="crossover-row"><span>${escapeHtml(row.label)}</span><strong>${escapeHtml(row.left)}</strong><b>VS</b><strong>${escapeHtml(row.right)}</strong></div>`).join("")}</div></div>` : `<div class="hint playoff-seeding-hint">Playoff seeding avoids same-Pool first-round matches where possible. · 尽量跨组配对</div>`}
+          <div class="playoff-qualification-title">FULL POOL STANDINGS FOR PLAYOFF CHECK · 出线检查</div>
+          <div class="playoff-standings-grid">
+            ${cat.pools.map(pool => {
+              const rows = standingsByPool.get(pool.id) || [];
+              return `<div class="pool-rank"><table><thead><tr><th colspan="8">${escapeHtml(pool.name)} · ${rows.length} TEAMS</th></tr><tr><th>#</th><th>TEAM</th><th>W</th><th>L</th><th>PTS</th><th>H2H</th><th>DIFF</th><th>PF</th></tr></thead><tbody>${rows.map((row,idx) => `<tr class="${idx < Number(pool.advance || 0) ? "qualifier" : ""}"><td>${idx+1}</td><td>${escapeHtml(row.name)}</td><td>${row.wins}</td><td>${row.losses}</td><td>${row.points}</td><td class="tiebreak-cell">${escapeHtml(row.tieBreakNote || "-")}</td><td>${row.diff > 0 ? "+" : ""}${row.diff}</td><td>${row.for}</td></tr>`).join("")}</tbody></table></div>`;
+            }).join("")}
+          </div>
+          <div class="inline-edit-grid playoff-rule-grid">
             <div>
-              <label>季军规则 / 三四名赛</label>
+              <label>THIRD PLACE RULE · 季军规则</label>
               <select class="compact-input" data-action="cat-thirdplace-input" data-cat-id="${cat.id}">
-                <option value="margin" ${cat.playoffThirdPlace !== "bronze" ? "selected" : ""}>不打三四名赛：按半决赛败方输球分差判季军</option>
-                <option value="bronze" ${cat.playoffThirdPlace === "bronze" ? "selected" : ""}>生成三四名赛：胜者为季军</option>
+                <option value="margin" ${cat.playoffThirdPlace !== "bronze" ? "selected" : ""}>NO BRONZE MATCH · Rank semifinal losers by loss margin</option>
+                <option value="bronze" ${cat.playoffThirdPlace === "bronze" ? "selected" : ""}>PLAY BRONZE MATCH · Winner takes third place</option>
               </select>
             </div>
             <div>
-              <label>当前规则</label>
+              <label>CURRENT RULE · 当前规则</label>
               <input class="compact-input" value="${escapeHtml(thirdPlaceRuleLabel(cat))}" disabled>
             </div>
           </div>
 
           <div class="admin-actions">
-            <button class="ghost" data-action="generate-rr" data-cat-id="${cat.id}">重新生成 RR</button>
-            <button class="primary" data-action="generate-playoff" data-cat-id="${cat.id}">生成 Playoff</button>
-            <button class="danger" data-action="delete-cat" data-cat-id="${cat.id}">删除 Cat</button>
+            <button class="ghost" data-action="generate-rr" data-cat-id="${cat.id}">REGENERATE RR · 重排</button>
+            <button class="primary" data-action="generate-playoff" data-cat-id="${cat.id}">GENERATE PLAYOFF · 生成</button>
+            <button class="danger" data-action="delete-cat" data-cat-id="${cat.id}">DELETE CATEGORY · 删除</button>
           </div>
         </article>`;
       }
@@ -1669,34 +2008,9 @@ Pool B
       function computeStandings(catId, poolId){
         const pool = getPool(catId, poolId);
         if (!pool) return [];
-        const rows = pool.teams.map(t => ({
-          teamId: t.id, name: t.name, played:0, wins:0, losses:0, points:0, for:0, against:0, diff:0
-        }));
-        const byTeam = new Map(rows.map(r => [r.teamId, r]));
-        state.matches
-          .filter(m => m.catId === catId && m.poolId === poolId && m.stage === "RR" && m.status === "done")
-          .forEach(m => {
-            const a = byTeam.get(m.teamAId);
-            const b = byTeam.get(m.teamBId);
-            if (!a || !b) return;
-            const sa = Number(m.scoreA);
-            const sb = Number(m.scoreB);
-            if (!Number.isFinite(sa) || !Number.isFinite(sb)) return;
-            a.played++; b.played++;
-            a.for += sa; a.against += sb;
-            b.for += sb; b.against += sa;
-            if (sa > sb){ a.wins++; b.losses++; a.points += 2; }
-            else if (sb > sa){ b.wins++; a.losses++; b.points += 2; }
-          });
-        rows.forEach(r => r.diff = r.for - r.against);
-        rows.sort((a,b) => 
-          b.points - a.points ||
-          b.wins - a.wins ||
-          b.diff - a.diff ||
-          b.for - a.for ||
-          a.name.localeCompare(b.name, "zh-CN")
-        );
-        return rows;
+        const completed = state.matches
+          .filter(m => m.catId === catId && m.poolId === poolId && m.stage === "RR" && m.status === "done");
+        return computePoolStandings(pool.teams, completed, { winPoints: 2 });
       }
 
       function parsePoolText(text){
@@ -1774,39 +2088,22 @@ Pool B
       function generatePlayoffForCat(catId){
         const cat = getCat(catId);
         if (!cat) return 0;
-        const qualifiers = [];
-        cat.pools.forEach(pool => {
-          const standings = computeStandings(cat.id, pool.id);
-          const take = Math.max(0, Math.min(Number(pool.advance || 0), standings.length));
-          standings.slice(0, take).forEach((row, idx) => {
-            qualifiers.push({
-              teamId: row.teamId,
-              name: row.name,
-              poolId: pool.id,
-              poolName: pool.name,
-              rank: idx + 1,
-              points: row.points,
-              diff: row.diff,
-              scored: row.for
-            });
-          });
-        });
+        const qualifiers = collectPlayoffQualifiers(cat);
         if (qualifiers.length < 2) {
           showToast("至少需要 2 支出线队伍才能生成 Playoff。");
           return 0;
         }
 
         state.matches = state.matches.filter(m => !(m.catId === catId && m.stage !== "RR"));
-        const ordered = seedQualifiers(cat, qualifiers);
-        const bracketSize = nextPowerOfTwo(ordered.length);
-        const slots = ordered.slice();
-        while (slots.length < bracketSize) slots.push({teamId:"BYE", name:"BYE", poolId:"", poolName:"", rank:999});
-
-        const firstPairs = [];
-        for (let i = 0; i < bracketSize / 2; i++){
-          firstPairs.push([slots[i], slots[bracketSize - 1 - i]]);
+        const bracketPlan = buildPlayoffBracketPlan(cat, qualifiers);
+        if (bracketPlan.strategy === "three-pool-six-seed") {
+          const count = generateThreePoolSixSeedPlayoff(cat, bracketPlan);
+          cat.status = "playoff";
+          return count;
         }
-        fixSamePoolFirstRound(firstPairs);
+        const ordered = bracketPlan.ordered;
+        const bracketSize = bracketPlan.bracketSize;
+        const firstPairs = bracketPlan.firstPairs;
 
         const roundsTotal = Math.log2(bracketSize);
         const roundMatches = [];
@@ -1908,50 +2205,126 @@ Pool B
         return state.matches.filter(m => m.catId === cat.id && m.stage !== "RR").length;
       }
 
-      function seedQualifiers(cat, qualifiers){
-        const byPool = new Map();
-        qualifiers.forEach(q => {
-          if (!byPool.has(q.poolId)) byPool.set(q.poolId, []);
-          byPool.get(q.poolId).push(q);
+      function buildPlayoffBracketPlan(cat, qualifiers){
+        return buildPlayoffBracketPlanCore(cat.pools, qualifiers, {
+          manualSeedOrder: cat.playoffSeedOrder || []
         });
-        for (const arr of byPool.values()){
-          arr.sort((a,b) => a.rank - b.rank || b.points - a.points || b.diff - a.diff || b.scored - a.scored);
-        }
-        const ordered = [];
-        const maxRank = Math.max(...qualifiers.map(q => q.rank));
-        for (let rank = 1; rank <= maxRank; rank++){
-          const pools = rank % 2 === 1 ? cat.pools : cat.pools.slice().reverse();
-          pools.forEach(pool => {
-            const q = (byPool.get(pool.id) || []).find(x => x.rank === rank);
-            if (q) ordered.push(q);
+      }
+
+      function generateThreePoolSixSeedPlayoff(cat, bracketPlan){
+        const seeds = bracketPlan.ordered || [];
+        if (seeds.length !== 6) return 0;
+        let seq = (state.matches.reduce((max, m) => Math.max(max, Number(m.sequence || 0)), 0) || 0) + 1;
+        const makeMatch = (overrides) => ({
+          id: uid("match"),
+          catId: cat.id,
+          poolId: "",
+          courtId: "",
+          scoreA: "",
+          scoreB: "",
+          winnerId: "",
+          status: "waiting",
+          sequence: seq++,
+          createdAt: Date.now(),
+          ...overrides
+        });
+
+        // Keep the requested game order in the official schedule:
+        // QF1 = Seed 3 v Seed 6, QF2 = Seed 4 v Seed 5.
+        const qf36 = makeMatch({
+          stage: "QF",
+          round: 1,
+          bracketIndex: 1,
+          bracketY: 2.35,
+          teamAId: seeds[2].teamId,
+          teamBId: seeds[5].teamId,
+          seedA: seeds[2],
+          seedB: seeds[5],
+          status: "queued"
+        });
+        const qf45 = makeMatch({
+          stage: "QF",
+          round: 1,
+          bracketIndex: 0,
+          bracketY: 0.65,
+          teamAId: seeds[3].teamId,
+          teamBId: seeds[4].teamId,
+          seedA: seeds[3],
+          seedB: seeds[4],
+          status: "queued"
+        });
+        const sf1 = makeMatch({
+          stage: "SF",
+          round: 2,
+          bracketIndex: 0,
+          bracketY: 0.65,
+          teamAId: seeds[0].teamId,
+          teamBId: "",
+          seedA: seeds[0],
+          teamBFrom: qf45.id,
+          status: "waiting"
+        });
+        const sf2 = makeMatch({
+          stage: "SF",
+          round: 2,
+          bracketIndex: 1,
+          bracketY: 2.35,
+          teamAId: seeds[1].teamId,
+          teamBId: "",
+          seedA: seeds[1],
+          teamBFrom: qf36.id,
+          status: "waiting"
+        });
+        const final = makeMatch({
+          stage: "F",
+          round: 3,
+          bracketIndex: 0,
+          bracketY: 1.5,
+          teamAId: "",
+          teamBId: "",
+          teamAFrom: sf1.id,
+          teamBFrom: sf2.id,
+          status: "waiting"
+        });
+
+        qf45.feedsTo = sf1.id;
+        qf45.feedsSide = "B";
+        qf36.feedsTo = sf2.id;
+        qf36.feedsSide = "B";
+        sf1.feedsTo = final.id;
+        sf1.feedsSide = "A";
+        sf2.feedsTo = final.id;
+        sf2.feedsSide = "B";
+
+        const generated = [qf36, qf45, sf1, sf2];
+        if (cat.playoffThirdPlace === "bronze") {
+          const bronze = makeMatch({
+            stage: "BR",
+            round: 3,
+            bracketIndex: 99,
+            teamAId: "",
+            teamBId: "",
+            teamAFrom: sf1.id,
+            teamBFrom: sf2.id,
+            teamAFromType: "loser",
+            teamBFromType: "loser",
+            status: "waiting"
           });
+          sf1.loserFeedsTo = bronze.id;
+          sf1.loserFeedsSide = "A";
+          sf2.loserFeedsTo = bronze.id;
+          sf2.loserFeedsSide = "B";
+          generated.push(bronze);
         }
-        return ordered;
-      }
+        generated.push(final);
+        state.matches.push(...generated);
 
-      function fixSamePoolFirstRound(pairs){
-        for (let i = 0; i < pairs.length; i++){
-          const [a,b] = pairs[i];
-          if (!a || !b || a.teamId === "BYE" || b.teamId === "BYE") continue;
-          if (a.poolId && a.poolId === b.poolId) {
-            for (let j = pairs.length - 1; j >= 0; j--){
-              if (i === j) continue;
-              const candidate = pairs[j][1];
-              if (!candidate || candidate.teamId === "BYE") continue;
-              if (candidate.poolId !== a.poolId && candidate.poolId !== pairs[j][0]?.poolId) {
-                pairs[j][1] = b;
-                pairs[i][1] = candidate;
-                break;
-              }
-            }
-          }
+        // Keep only a valid manual order. Automatic ranking remains live and
+        // will be recalculated from standings until staff moves a seed.
+        if (Array.isArray(cat.playoffSeedOrder) && cat.playoffSeedOrder.length && !bracketPlan.manualApplied) {
+          cat.playoffSeedOrder = [];
         }
-      }
-
-      function nextPowerOfTwo(n){
-        let p = 1;
-        while (p < n) p *= 2;
-        return p;
+        return generated.length;
       }
 
       function playoffStageName(round, totalRounds){
@@ -2070,6 +2443,7 @@ Pool B
         const m = matches[0];
         m.status = "playing";
         m.courtId = courtId;
+        m.prepareCourtId = courtId;
         removePrepareMatch(m.id);
         m.startedAt = Date.now();
         return m;
@@ -2090,12 +2464,13 @@ Pool B
           showToast("队伍正在其他场地比赛，不能重复安排。");
           return;
         }
-        if (!courtCanRunCat(courtId, m.catId)) {
-          showToast("这个 Cat 还没有分配到该场地。");
+        if (!courtCanRunMatch(courtId, m)) {
+          showToast("This court is not enabled for the match category / pool. · 场地未开放此项目小组");
           return;
         }
         m.status = "playing";
         m.courtId = courtId;
+        m.prepareCourtId = courtId;
         removePrepareMatch(m.id);
         m.startedAt = Date.now();
         saveState();
@@ -2107,6 +2482,7 @@ Pool B
         const m = state.matches.find(x => x.id === matchId);
         if (!m || m.status !== "playing") return;
         m.status = "queued";
+        m.prepareCourtId = m.courtId || m.prepareCourtId || "";
         m.courtId = "";
         m.scoreA = m.scoreA || "";
         m.scoreB = m.scoreB || "";
@@ -2167,9 +2543,24 @@ Pool B
           propagateMatchResult(m);
           runAutoByes(m.catId);
         }
+        openScoreCorrectionCatIds.add(m.catId);
         saveState();
         renderAll();
         showToast(m.stage === "RR" ? "比分已修改，RR 排名已更新。" : "Playoff 比分已修改，晋级关系已更新。");
+      }
+
+      function moveThreePoolSeed(catId, teamId, delta){
+        const cat = getCat(catId);
+        const plan = getThreePoolSeedPlan(cat);
+        if (!cat || !plan || !teamId) return false;
+        const ids = plan.ordered.map(seed => seed.teamId);
+        const index = ids.indexOf(teamId);
+        const nextIndex = Math.max(0, Math.min(ids.length - 1, index + delta));
+        if (index < 0 || nextIndex === index) return false;
+        const [moved] = ids.splice(index, 1);
+        ids.splice(nextIndex, 0, moved);
+        cat.playoffSeedOrder = ids;
+        return true;
       }
 
 async function handleClick(e){
@@ -2218,7 +2609,7 @@ async function handleClick(e){
     "generate-rr","generate-playoff","delete-cat","add-cat","add-court-to-cat",
     "clear-data","load-sample","prepare-match","prepare-top","prepare-up","prepare-down",
     "unprepare-match","clear-prepare-list","hold-match","release-match","release-and-top",
-    "save-score-edit"
+    "save-score-edit","seed-up","seed-down","reset-playoff-seeds"
   ]);
   if (!adminUnlocked && writeActions.has(action)){
     showToast("请先打开后台。所有云端修改都需要工作人员登录。");
@@ -2299,6 +2690,24 @@ async function handleClick(e){
     updateCompletedScore(btn.dataset.matchId);
     return;
   }
+  if (action === "seed-up" || action === "seed-down"){
+    const changed = moveThreePoolSeed(btn.dataset.catId, btn.dataset.teamId, action === "seed-up" ? -1 : 1);
+    if (changed) {
+      saveState();
+      renderAll();
+      showToast("Manual cross-pool seed order updated. Regenerate the Playoff to apply it. · 跨池排名已调整");
+    }
+    return;
+  }
+  if (action === "reset-playoff-seeds"){
+    const cat = getCat(btn.dataset.catId);
+    if (!cat) return;
+    cat.playoffSeedOrder = [];
+    saveState();
+    renderAll();
+    showToast("Cross-pool seeds returned to automatic ranking. · 已恢复自动排名");
+    return;
+  }
   if (action === "fill-empty-courts"){
     let count = 0;
     emptyCourts().forEach(c => { if (assignNextToCourt(c.id, adminCatFilter)) count++; });
@@ -2332,6 +2741,7 @@ async function handleClick(e){
     const existing = state.matches.some(m => m.catId === cat.id && m.stage === "RR");
     if (existing && !confirm("重新生成 RR 会删除此 Cat 现有 Round Robin 赛程和已录入比分，然后重新排表。确认继续？")) return;
     state.matches = state.matches.filter(m => !(m.catId === cat.id && m.stage === "RR"));
+    cat.playoffSeedOrder = [];
     generateRoundRobinForCat(state, cat.id, false);
     saveState();
     renderAll();
@@ -2342,11 +2752,13 @@ async function handleClick(e){
     const cat = getCat(btn.dataset.catId);
     if (!cat) return;
     const rrNotDone = state.matches.some(m => m.catId === cat.id && m.stage === "RR" && m.status !== "done");
-    if (rrNotDone && !confirm("此 Cat 的 RR 还没有全部完成。是否仍按当前排名生成 Playoff？")) return;
+    if (rrNotDone && !confirm("Round Robin is not complete. Generate the Playoff from the current standings anyway? · 小组赛尚未完成")) return;
+    const existingPlayoff = state.matches.filter(m => m.catId === cat.id && m.stage !== "RR");
+    if (existingPlayoff.length && !confirm(`Replace ${existingPlayoff.length} existing Playoff matches and their scores for ${cat.name}? This is required to apply the new seeding. · 将重建淘汰赛`)) return;
     const count = generatePlayoffForCat(cat.id);
     saveState();
     renderAll();
-    showToast(count ? `已生成 ${count} 场 Playoff（${thirdPlaceRuleLabel(cat)}）。` : "未生成 Playoff。");
+    showToast(count ? `Generated ${count} Playoff matches · ${thirdPlaceRuleLabel(cat)}` : "No Playoff was generated.");
     return;
   }
   if (action === "delete-cat"){
@@ -2359,6 +2771,10 @@ async function handleClick(e){
     if (adminSettingsCatId === catId) adminSettingsCatId = "";
     delete adminPoolTabByCat[catId];
     state.settings.dashboardCatIds = state.settings.dashboardCatIds.filter(id => id !== catId);
+    state.settings.prepareMatchIds = (state.settings.prepareMatchIds || []).filter(id => state.matches.some(match => match.id === id));
+    state.settings.courts.forEach(court => {
+      if (court.poolAccess && typeof court.poolAccess === "object") delete court.poolAccess[catId];
+    });
     saveState();
     renderAll();
     showToast("Cat 已删除。");
@@ -2406,6 +2822,7 @@ async function handleClick(e){
     adminCatFilter = "all";
     adminSettingsCatId = "";
     adminPoolTabByCat = {};
+    openScoreCorrectionCatIds = new Set();
     saveState();
     renderAll();
     showToast("示例数据已载入。");
@@ -2418,6 +2835,7 @@ async function handleClick(e){
     adminCatFilter = "all";
     adminSettingsCatId = "";
     adminPoolTabByCat = {};
+    openScoreCorrectionCatIds = new Set();
     saveState();
     renderAll();
     showToast("数据已清空。");
@@ -2431,8 +2849,8 @@ function handleChange(e){
   if (!action) return;
 
   const cloudMutationActions = new Set([
-    "dashboard-cat-toggle","auto-next","prepare-limit","cat-active-toggle",
-    "court-all-active-toggle","court-cat-toggle","cat-thirdplace-input",
+    "dashboard-cat-toggle","auto-next","prepare-limit","prepare-court-select","cat-active-toggle",
+    "court-all-active-toggle","court-cat-toggle","court-all-pools-toggle","court-pool-toggle","cat-thirdplace-input",
     "cat-court-toggle","pool-advance-input","cat-name-input","pool-name-input","team-name-input"
   ]);
   if (!adminUnlocked && cloudMutationActions.has(action) && action !== "dashboard-cat-toggle"){
@@ -2482,6 +2900,21 @@ function handleChange(e){
     showToast(`TV 1 will display the next ${state.settings.prepareLimit} games.`);
     return;
   }
+  if (action === "prepare-court-select"){
+    const match = getMatch(el.dataset.matchId);
+    if (!match) return;
+    const nextCourtId = el.value || "";
+    if (nextCourtId && !courtCanRunMatch(nextCourtId, match)) {
+      showToast("That court is not enabled for this category / pool. · 该场地未开放此项目小组");
+      renderAll();
+      return;
+    }
+    match.prepareCourtId = nextCourtId;
+    saveState();
+    renderAll();
+    showToast(nextCourtId ? `Potential court set to ${getCourt(nextCourtId)?.name || nextCourtId}.` : "Potential court returned to AUTO.");
+    return;
+  }
   if (action === "cat-active-toggle"){
     const cat = getCat(el.dataset.catId);
     if (!cat) return;
@@ -2519,6 +2952,19 @@ function handleChange(e){
     renderAll();
     return;
   }
+  if (action === "court-all-pools-toggle"){
+    setCourtAllPools(el.dataset.courtId, el.dataset.catId, el.checked);
+    saveState();
+    renderAll();
+    showToast(el.checked ? "Court opened to all pools in this category." : "Select the pools this court may run.");
+    return;
+  }
+  if (action === "court-pool-toggle"){
+    setCourtPoolAccess(el.dataset.courtId, el.dataset.catId, el.dataset.poolId, el.checked);
+    saveState();
+    renderAll();
+    return;
+  }
   if (action === "cat-thirdplace-input"){
     const cat = getCat(el.dataset.catId);
     if (!cat) return;
@@ -2538,6 +2984,8 @@ function handleChange(e){
     const pool = getPool(el.dataset.catId, el.dataset.poolId);
     if (!pool) return;
     pool.advance = Math.max(0, Math.min(Number(el.value || 0), pool.teams.length));
+    const cat = getCat(el.dataset.catId);
+    if (cat) cat.playoffSeedOrder = [];
     saveState();
     renderAll();
     return;
@@ -2614,6 +3062,7 @@ function importJsonFile(file){
       adminCatFilter = "all";
       adminSettingsCatId = "";
       adminPoolTabByCat = {};
+      openScoreCorrectionCatIds = new Set();
       saveState();
       renderAll();
       showToast("导入成功。");
@@ -2629,6 +3078,12 @@ function importJsonFile(file){
 document.addEventListener("click", handleClick);
 document.addEventListener("change", handleChange);
 document.addEventListener("input", handleInput);
+document.addEventListener("toggle", (event) => {
+  const details = event.target;
+  if (!(details instanceof HTMLDetailsElement) || !details.dataset.scoreCorrectionCat) return;
+  if (details.open) openScoreCorrectionCatIds.add(details.dataset.scoreCorrectionCat);
+  else openScoreCorrectionCatIds.delete(details.dataset.scoreCorrectionCat);
+}, true);
 document.addEventListener("change", (e) => {
   if (e.target && e.target.id === "importFile" && e.target.files?.[0]) {
     if (!adminUnlocked){

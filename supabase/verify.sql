@@ -16,6 +16,14 @@ from public.tournament_state_history
 order by created_at desc
 limit 10;
 
-
--- v6 application-state fields (may remain null until the first v6 admin save when upgrading an existing event)
-select slug, state ->> 'version' as app_state_version, state #>> '{settings,prepareLimit}' as prepare_limit from public.tournaments where slug = 'wulin-annual-2026';
+-- v8 application-state fields. Existing deployments show v8 after the first
+-- successful staff save from the upgraded app.
+select
+  slug,
+  version as cloud_row_version,
+  state ->> 'version' as app_state_version,
+  state #>> '{settings,prepareLimit}' as prepare_limit,
+  jsonb_array_length(coalesce(state #> '{settings,courts}', '[]'::jsonb)) as court_count,
+  jsonb_array_length(coalesce(state -> 'categories', '[]'::jsonb)) as category_count
+from public.tournaments
+where slug = 'wulin-annual-2026';
