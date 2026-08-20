@@ -1,7 +1,7 @@
 {
-  "name": "wulin-tournament-cloud",
+  "name": "wulin-tournament-cloud-v8",
   "private": true,
-  "version": "1.0.0",
+  "version": "8.0.0",
   "type": "module",
   "scripts": {
     "dev": "npx vercel dev",
@@ -11,10 +11,10 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.57.4"
+    "@supabase/supabase-js": "2.57.4"
   },
   "devDependencies": {
-    "vite": "^7.1.7"
+    "vite": "7.1.7"
   },
   "engines": {
     "node": ">=20.19"

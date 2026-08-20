@@ -1,51 +1,71 @@
-# 武林年度赛 · Supabase + Vercel 实时版
+# Wulin Tournament Control · Supabase + Vercel v8
 
-这是从离线 localStorage 版本升级而来的正式云端版本。
+正式云端版，面向 6 场地年度赛。公开端分为两台电视，工作人员在 Admin 中实时排场、录分、调整 On Deck、设置 Active Categories / Court Routes，并通过 Supabase Realtime 同步到全部设备。
 
-- **Vercel**：部署 Vite 前端和受保护的 Serverless API。
-- **Supabase**：保存唯一共享赛程状态、历史快照，并通过 Realtime 推送到大屏和观众设备。
-- **公开页面**：匿名只读，可查看 Dashboard、完整赛程、RR 排名、Playoff 结果和颁奖名次。
-- **工作人员后台**：输入 PIN 后获得 HttpOnly Cookie；所有写入通过 Vercel API，Supabase secret key 不会进入浏览器。
-- **并发保护**：每次保存使用数据库版本号进行乐观锁；两台后台同时修改时不会静默覆盖。
-
-详细部署说明见：[`DEPLOY_ZH.md`](./DEPLOY_ZH.md)  
-架构与安全边界见：[`ARCHITECTURE.md`](./ARCHITECTURE.md)
-
-## 本地目录
+## 页面入口
 
 ```text
-api/                         Vercel Functions：登录、会话、保存状态
-server/                      服务器端安全、Session、Supabase 管理客户端
-src/app.js                   比赛管理前端逻辑
-src/styles.css               武林风格界面
-public/assets/               Logo、合作方和二维码素材
-supabase/schema.sql          数据库、RLS、Realtime、保存 RPC
-supabase/verify.sql          部署后检查
-supabase/restore-example.sql 历史版本紧急恢复模板
-tests/                       服务器端安全和数据结构测试
+?view=operations  TV 1：Live Courts + On Deck + Active Category progress
+?view=results     TV 2：Standings + Visual Playoff Bracket
+?view=schedule    Full Schedule
+?view=admin       Staff Admin
 ```
 
-## 主要功能
+## v8 重点
 
-- 6 个或更多场地的当前比赛展示与后台计分。
-- Cat 可自由分配场地，只运行当天当前时段选择的 Cat。
-- 后台人工指定、置顶、调整或暂缓下一批 2–3 组准备队伍。
-- Round Robin 自动排程、积分、净胜分、排名与出线人数控制。
-- Cat、Pool、队伍名称随时修改。
-- 已完成 RR / Playoff 比分可修正，并重新计算晋级关系。
-- 多 Pool Playoff。
-- 可选择生成三四名赛；不打时按两名半决赛败方的输球分差判季军。
-- Dashboard 显示 Playoff 每场结果、冠军、亚军、季军和第四名。
-- JSON 导入/导出备份。
-- 多设备实时同步和冲突保护。
+- 三个 Pool、每 Pool 前两名出线时，自动产生跨 Pool 的 6 个 Seeds；
+- 跨 Pool 自动排名：Win Points → 同 Pool Head-to-Head → Point Difference → Points For；
+- Seed 1 / Seed 2 首轮 BYE；QF 为 Seed 3 vs 6、Seed 4 vs 5；
+- SF1：Seed 1 vs Winner(Seed 4 vs 5)；SF2：Seed 2 vs Winner(Seed 3 vs 6)；
+- Admin 显示完整跨 Pool Seed Table，并允许 Move Up / Move Down 手动调整；
+- TV 1 顶部按每个 Active Category 显示 Done / Total、Queue、Live；
+- On Deck 的 Expected Court 字样放大；
+- Score Corrections 移到 Admin 最后，并按 Category 折叠；
+- 保留 v7 的双 Pool A1 vs B2 / A2 vs B1、H2H 排名、图形化 Bracket、Court Category + Pool Routes、Potential Court 等功能。
 
-## 快速命令
+## 更新已有部署
+
+先阅读：
+
+```text
+QUICK_UPDATE_V8_ZH.md
+UPDATE_EXISTING_DEPLOYMENT_ZH.md
+RELEASE_CHECKLIST_V8_ZH.md
+```
+
+现有 Supabase 项目不需要重新建表，也不要重新运行完整 `supabase/schema.sql`。v8 新增字段继续存放在原来的 `public.tournaments.state` JSONB 中。
+
+## 全新部署
+
+阅读：
+
+```text
+DEPLOY_ZH.md
+```
+
+只有新建 Supabase Project 时才运行：
+
+```text
+supabase/schema.sql
+```
+
+## 安全结构
+
+- 浏览器只包含 Supabase URL 与 publishable key；
+- 公开页面通过 RLS 只读赛事；
+- 后台写入经 Vercel `/api/state`；
+- Supabase secret key 只存在 Vercel Server Function；
+- Staff PIN 存在 Vercel `ADMIN_PIN`；
+- Session 使用签名 HttpOnly Cookie；
+- 多设备写入使用 optimistic version lock；
+- Supabase 保留最近 250 个完整 state snapshots。
+
+## 自动测试
 
 ```bash
 npm install
-npm run dev       # 使用 Vercel CLI，同时启动前端和 /api Functions
 npm test
 npm run build
 ```
 
-本项目没有包含任何真实 Supabase key、工作人员 PIN 或 Session secret。
+测试覆盖登录安全、状态验证、Pool H2H、双 Pool 交叉半决赛、三 Pool 六种子排名、手动 Seed 顺序、Court Pool Routes、自动 On Deck，以及忙碌队伍的人工 On Deck。

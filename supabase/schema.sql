@@ -127,19 +127,20 @@ values (
   '武林年度赛 Tournament Control',
   $state$
   {
-    "version": 4,
+    "version": 8,
     "settings": {
       "eventName": "武林年度赛 Tournament Control",
       "autoNext": true,
       "dashboardCatIds": [],
+      "prepareLimit": 6,
       "prepareMatchIds": [],
       "courts": [
-        {"id":"court1","name":"Court 1"},
-        {"id":"court2","name":"Court 2"},
-        {"id":"court3","name":"Court 3"},
-        {"id":"court4","name":"Court 4"},
-        {"id":"court5","name":"Court 5"},
-        {"id":"court6","name":"Court 6"}
+        {"id":"court1","name":"Court 1","allowAllActive":false,"poolAccess":{}},
+        {"id":"court2","name":"Court 2","allowAllActive":false,"poolAccess":{}},
+        {"id":"court3","name":"Court 3","allowAllActive":false,"poolAccess":{}},
+        {"id":"court4","name":"Court 4","allowAllActive":false,"poolAccess":{}},
+        {"id":"court5","name":"Court 5","allowAllActive":false,"poolAccess":{}},
+        {"id":"court6","name":"Court 6","allowAllActive":false,"poolAccess":{}}
       ]
     },
     "categories": [],
